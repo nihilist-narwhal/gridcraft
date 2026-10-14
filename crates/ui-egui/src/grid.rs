@@ -2566,6 +2566,14 @@ fn select_ranges(app: &mut SheetApp, r: RangeRef, add: bool, active: CellRef) {
 
 /// Grid keyboard handling when no text field has focus.
 fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo: &Geo, sh: &Sheet) {
+    // Embedded without the keyboard: the host's widgets get it, so the grid neither keeps nor
+    // grabs egui's focus.
+    if !app.has_keyboard() {
+        if ctx.memory(|m| m.focused()) == Some(resp.id) {
+            ctx.memory_mut(|m| m.surrender_focus(resp.id));
+        }
+        return;
+    }
     // Focus left on an editor that no longer exists goes back to the grid.
     let stale = [egui::Id::new("gridcraft.cell_editor"), egui::Id::new("gridcraft.formula_bar"), crate::text_box::editor_id()];
     let editing = app.editor.is_some() || app.text_box_editor.is_some();

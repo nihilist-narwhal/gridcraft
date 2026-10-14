@@ -137,9 +137,135 @@ impl Tokens {
         }
     }
 
+    /// The tokens for the context's current appearance (light or dark).
     pub fn get(ctx: &egui::Context) -> Tokens {
-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
+        Tokens::of(ctx, ctx.global_style().visuals.dark_mode)
     }
+
+    /// The light or dark tokens: the embedding application's when it set a [`HostTheme`]
+    /// ([`set_host_theme`]), GridCraft's own otherwise.
+    pub fn of(ctx: &egui::Context, dark: bool) -> Tokens {
+        match host_theme(ctx) {
+            Some(host) => host.tokens(dark),
+            None if dark => Tokens::dark(),
+            None => Tokens::light(),
+        }
+    }
+}
+
+/// The colours an embedding application's design system names. [`Palette::tokens`] maps them onto
+/// GridCraft's chrome and derives the rest (hover and pressed fills, header highlights, the
+/// selection fill); the cells keep the workbook's own colours (white paper, black text).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Palette {
+    /// The active tab underline, switches, links and contextual tabs.
+    pub accent: Color32,
+    /// The cell selection outline and the selected row and column headers.
+    pub selection: Color32,
+    /// The chrome behind the ribbon, the formula bar, the sheet tabs and the status bar.
+    pub surface: Color32,
+    /// Raised surfaces on the chrome: the ribbon body, menus, the active sheet tab, text fields.
+    pub raised: Color32,
+    /// Hairlines: the ribbon border, separators, field borders and header lines.
+    pub border: Color32,
+    /// Text and icons.
+    pub text: Color32,
+    /// Secondary text: hints, inactive tabs and dimmed icons.
+    pub text_muted: Color32,
+}
+
+impl Palette {
+    /// The full token set for this palette in light or dark mode.
+    pub fn tokens(&self, dark: bool) -> Tokens {
+        let base = if dark { Tokens::dark() } else { Tokens::light() };
+        // Interaction fills tint the chrome towards the text colour; dark chrome needs a stronger tint.
+        let (hover, pressed) = if dark { (0.10, 0.16) } else { (0.05, 0.10) };
+        Tokens {
+            dark,
+            window: self.surface,
+            ribbon: self.raised,
+            ribbon_border: self.border,
+            text: self.text,
+            text_dim: self.text_muted,
+            text_disabled: mix(self.text_muted, self.surface, 0.5),
+            accent: self.accent,
+            accent_dark: mix(self.accent, Color32::BLACK, 0.2),
+            accent_soft: mix(self.raised, self.accent, if dark { 0.22 } else { 0.14 }),
+            hover: mix(self.surface, self.text, hover),
+            pressed: mix(self.surface, self.text, pressed),
+            separator: self.border,
+            desk: mix(self.surface, self.text, if dark { 0.06 } else { 0.08 }),
+            header_bg: mix(self.surface, self.raised, 0.5),
+            header_text: self.text_muted,
+            header_line: self.border,
+            header_sel_bg: mix(self.raised, self.selection, if dark { 0.25 } else { 0.12 }),
+            header_sel_text: self.selection,
+            header_all_bg: mix(self.raised, self.selection, 0.3),
+            sel_fill: with_alpha(self.selection, if dark { 0x24 } else { 0x1C }),
+            sel_border: self.selection,
+            input_bg: self.raised,
+            input_border: self.border,
+            tab_bar: self.surface,
+            tab_active: self.raised,
+            status_bar: self.surface,
+            menu_bg: self.raised,
+            ..base
+        }
+    }
+}
+
+/// An embedding application's colours for both appearances. Which one applies follows the egui
+/// context's light/dark choice; the fields are complete [`Tokens`], so a host can start from
+/// [`HostTheme::from_palettes`] and adjust any single token.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostTheme {
+    pub light: Tokens,
+    pub dark: Tokens,
+}
+
+impl HostTheme {
+    pub fn from_palettes(light: &Palette, dark: &Palette) -> HostTheme {
+        HostTheme { light: light.tokens(false), dark: dark.tokens(true) }
+    }
+
+    /// The tokens for one appearance (their `dark` flag always matches it).
+    pub fn tokens(&self, dark: bool) -> Tokens {
+        if dark { Tokens { dark: true, ..self.dark } } else { Tokens { dark: false, ..self.light } }
+    }
+}
+
+/// Where the host theme lives in the egui context, so every `Tokens::get` sees it.
+const HOST_THEME: &str = "gridcraft.host_theme";
+
+/// Install (or with `None` remove) the embedding application's colours for this context.
+/// [`crate::SheetApp::set_host_theme`] keeps it installed; this is the low-level hook.
+pub fn set_host_theme(ctx: &egui::Context, theme: Option<HostTheme>) {
+    let id = egui::Id::new(HOST_THEME);
+    ctx.data_mut(|d| match theme {
+        Some(theme) => {
+            d.insert_temp(id, theme);
+        }
+        None => {
+            d.remove::<HostTheme>(id);
+        }
+    });
+}
+
+/// The embedding application's colours for this context, if it set any.
+pub fn host_theme(ctx: &egui::Context) -> Option<HostTheme> {
+    ctx.data(|d| d.get_temp::<HostTheme>(egui::Id::new(HOST_THEME)))
+}
+
+/// `a` moved towards `b` by `t` (0 = `a`, 1 = `b`), per channel.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()), ch(a.a(), b.a()))
+}
+
+fn with_alpha(c: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
 pub const UI: &str = "ui";
@@ -677,39 +803,77 @@ pub fn symbol_face_installed() -> bool {
 
 pub fn apply(ctx: &egui::Context, dark: bool) {
     // Install both palettes before System can switch between the style slots.
-    for theme in [egui::Theme::Light, egui::Theme::Dark] {
-        let dark = theme == egui::Theme::Dark;
-        let t = if dark { Tokens::dark() } else { Tokens::light() };
-        let mut v = if dark { Visuals::dark() } else { Visuals::light() };
-        v.panel_fill = t.window;
-        v.window_fill = t.menu_bg;
-        v.extreme_bg_color = t.input_bg;
-        v.selection.bg_fill = t.accent_soft;
-        v.selection.stroke = Stroke::new(1.0, t.accent);
-        v.hyperlink_color = t.accent;
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
-        v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-        v.widgets.hovered.weak_bg_fill = t.hover;
-        v.widgets.active.weak_bg_fill = t.pressed;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, t.input_border);
-        v.window_corner_radius = egui::CornerRadius::same(10);
-        v.menu_corner_radius = egui::CornerRadius::same(8);
-        v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow };
-        ctx.set_visuals_of(theme, v);
-    }
+    apply_visuals(ctx);
     ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
     ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
-    ctx.all_styles_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        s.spacing.button_padding = egui::vec2(6.0, 3.0);
-        s.spacing.interact_size.y = 22.0;
-        s.text_styles.insert(egui::TextStyle::Body, ui_font(13.0));
-        s.text_styles.insert(egui::TextStyle::Button, ui_font(13.0));
-        s.text_styles.insert(egui::TextStyle::Small, ui_font(11.0));
-        s.text_styles.insert(egui::TextStyle::Heading, ui_bold(18.0));
-        s.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(MONO.into())));
-    });
+    ctx.all_styles_mut(spacing);
+}
+
+/// Installs the light and dark visuals (GridCraft's, or the host theme's) in the context.
+pub fn apply_visuals(ctx: &egui::Context) {
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.set_visuals_of(theme, visuals(&Tokens::of(ctx, theme == egui::Theme::Dark)));
+    }
+}
+
+/// egui's widget visuals for a token set.
+fn visuals(t: &Tokens) -> Visuals {
+    let mut v = if t.dark { Visuals::dark() } else { Visuals::light() };
+    v.panel_fill = t.window;
+    v.window_fill = t.menu_bg;
+    v.extreme_bg_color = t.input_bg;
+    v.selection.bg_fill = t.accent_soft;
+    v.selection.stroke = Stroke::new(1.0, t.accent);
+    v.hyperlink_color = t.accent;
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.hovered.weak_bg_fill = t.hover;
+    v.widgets.active.weak_bg_fill = t.pressed;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, t.input_border);
+    v.window_corner_radius = egui::CornerRadius::same(10);
+    v.menu_corner_radius = egui::CornerRadius::same(8);
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow };
+    v
+}
+
+/// GridCraft's spacing and text styles.
+fn spacing(s: &mut egui::Style) {
+    s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    s.spacing.button_padding = egui::vec2(6.0, 3.0);
+    s.spacing.interact_size.y = 22.0;
+    s.text_styles.insert(egui::TextStyle::Body, ui_font(13.0));
+    s.text_styles.insert(egui::TextStyle::Button, ui_font(13.0));
+    s.text_styles.insert(egui::TextStyle::Small, ui_font(11.0));
+    s.text_styles.insert(egui::TextStyle::Heading, ui_bold(18.0));
+    s.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(MONO.into())));
+}
+
+/// The style for the sheet's own region when it is embedded and leaves the context's global style
+/// to the host: the host's style with GridCraft's visuals (from `t`), spacing and text styles.
+pub fn sheet_style(base: &egui::Style, t: &Tokens) -> egui::Style {
+    let mut s = base.clone();
+    s.visuals = visuals(t);
+    spacing(&mut s);
+    s
+}
+
+/// GridCraft's font set merged into the embedding application's: the host keeps its font data and
+/// its own families (including the default proportional and monospace ones); GridCraft adds its
+/// faces and its named families (`ui`, `cell`, …), replacing older copies of them.
+pub fn merge_font_definitions(mut host: FontDefinitions, ours: FontDefinitions) -> FontDefinitions {
+    host.font_data.extend(ours.font_data);
+    host.families.extend(ours.families.into_iter().filter(|(family, _)| matches!(family, FontFamily::Name(_))));
+    host
+}
+
+/// Whether the context's fonts still carry GridCraft's interface and cell families (a host that
+/// replaces the whole font set drops them; drawing with a missing family would panic in egui).
+pub fn fonts_installed(ctx: &egui::Context) -> bool {
+    ctx.fonts(|f| {
+        let families = &f.definitions().families;
+        [UI, UI_BOLD, CELL].iter().all(|role| families.get(&FontFamily::Name((*role).into())).is_some_and(|chain| !chain.is_empty()))
+    })
 }
 
 /// Model colour → egui colour.

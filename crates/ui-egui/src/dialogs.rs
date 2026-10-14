@@ -2242,13 +2242,22 @@ fn command_search(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm
     let r = ui.add(egui::TextEdit::singleline(&mut d.search).desired_width(480.0).hint_text("Type a command, e.g. freeze, chart, bold…"));
     r.request_focus();
     let q = d.search.to_ascii_lowercase();
+    let matches = |id: &str, label: &str| q.is_empty() || label.to_ascii_lowercase().contains(&q) || id.to_ascii_lowercase().contains(&q);
     let cmds: Vec<(String, String, String)> = app
         .session
         .commands()
         .into_iter()
         .filter(|c| c.enabled)
-        .filter(|c| q.is_empty() || c.label.to_ascii_lowercase().contains(&q) || c.id.to_ascii_lowercase().contains(&q))
+        .filter(|c| matches(c.id, c.label))
         .map(|c| (c.id.to_string(), c.label.to_string(), c.menu.join(" › ")))
+        // The embedding application's commands, under their ribbon tab.
+        .chain(app.host_command_list().into_iter().filter_map(|c| {
+            let field = |k: &str| c.get(k).and_then(Json::as_str).unwrap_or_default().to_string();
+            let menu: Vec<String> =
+                c.get("menu").and_then(Json::as_array).map(|m| m.iter().filter_map(Json::as_str).map(str::to_string).collect()).unwrap_or_default();
+            let (id, label) = (field("id"), field("label"));
+            (c.get("enabled") == Some(&Json::Bool(true)) && matches(&id, &label)).then(|| (id, label, menu.join(" › ")))
+        }))
         .take(40)
         .collect();
     if ui.input(|i| i.key_pressed(Key::ArrowDown)) {

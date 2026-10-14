@@ -52,7 +52,7 @@ fn matches_target(action: &Action, target: &str) -> bool {
     match action {
         Action::Command(id) | Action::Pending(id) | Action::Control(id) => *id == target,
         Action::Dialog(name) => format!("dialog:{name}") == target,
-        Action::Tab(_) => false,
+        Action::Tab(_) | Action::HostTab(_) | Action::HostButton(..) => false,
     }
 }
 
@@ -85,6 +85,13 @@ pub fn group_extension(prefix: &str, targets: &[&str]) -> Vec<&'static str> {
         }
     }
     out
+}
+
+/// Whether a sequence an embedding application asks for would clash with the built-in table: it
+/// is a built-in sequence, a level that built-in sequences continue (like "J" before Draw's
+/// "JI"), or it continues a complete built-in sequence (like "HX" after Home's "H").
+pub fn conflicts(seq: &str) -> bool {
+    lookup(seq).is_some() || has_deeper(seq) || (1..seq.len()).any(|n| seq.get(..n).is_some_and(|prefix| lookup(prefix).is_some()))
 }
 
 /// The badge for a menu item: its finish sequence exactly one key below the current prefix.
@@ -171,6 +178,17 @@ mod tests {
             assert_eq!(tab_sequence(tab), Some(letter), "tab {tab}");
         }
         assert_eq!(tab_sequence("Automate"), None);
+    }
+
+    #[test]
+    fn host_sequences_must_not_clash_with_built_in_ones() {
+        assert!(conflicts("H"), "a built-in tab");
+        assert!(conflicts("J"), "an implicit level");
+        assert!(conflicts("HX"), "continues Home's H");
+        assert!(conflicts("HV"), "a built-in group level");
+        assert!(!conflicts("Y"));
+        assert!(!conflicts("JX"), "beside Draw's JI under the implicit J level");
+        assert!(!conflicts("Z1"));
     }
 
     #[test]

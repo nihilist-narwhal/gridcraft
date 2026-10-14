@@ -42,76 +42,18 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
         let rect = ui.max_rect();
         // Dragging the empty title area moves the window.
         let bg = ui.interact(rect, ui.id().with("drag_title"), Sense::click_and_drag());
-        if bg.drag_started() {
+        if bg.drag_started() && app.embed.window_controls {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
-        if bg.double_clicked() {
+        if bg.double_clicked() && app.embed.window_controls {
             let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
         }
         ui.horizontal_centered(|ui| {
             ui.add_space(TITLE_LEFT_PAD);
-            // AutoSave toggle (saves after each change when the workbook has a file).
-            ui.label(egui::RichText::new("AutoSave").font(theme::ui_font(12.5)).color(t.text_dim));
-            let on = app.grid.autosave();
-            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 16.0), Sense::click());
-            ui.painter().rect_filled(r, 8.0, if on { t.accent } else { Color32::TRANSPARENT });
-            ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if on { t.accent } else { t.text_dim }), StrokeKind::Inside);
-            let knob = if on { pos2(r.right() - 8.0, r.center().y) } else { pos2(r.left() + 8.0, r.center().y) };
-            ui.painter().circle_filled(knob, 5.0, if on { Color32::WHITE } else { t.text_dim });
-            if resp.on_hover_text("AutoSave: save after every change (workbooks saved to a file)").clicked() {
-                app.grid.toggle_autosave();
+            if app.embed.quick_access_toolbar {
+                quick_access_toolbar(app, ui, &t, ch);
             }
-            ui.add_space(6.0);
-            let __k = icon_button(ui, Icon::Home, t.text_dim, "Home", vec2(26.0, ch));
-            control_keytip(app, ui, &__k, "start");
-            if __k.clicked() {
-                app.open_dialog("start", json!({}));
-            }
-            if icon_button(ui, Icon::Save, t.text_dim, "Save (⌘S)", vec2(26.0, ch)).clicked()
-                // File operations must include the cell the user is still editing (as the File > Save menu item already does).
-                && app.commit_edit(0, 0, false, false)
-            {
-                app.run_or_alert("file.save", json!({}));
-            }
-            let can_undo = app.session.active().is_some_and(|d| !d.undo.is_empty());
-            let can_redo = app.session.active().is_some_and(|d| !d.redo.is_empty());
-            if icon_button(ui, Icon::Undo, if can_undo { t.text_dim } else { t.text_disabled }, "Undo (⌘Z)", vec2(26.0, ch)).clicked() && can_undo {
-                app.run_or_alert("edit.undo", json!({}));
-            }
-            let undo_list = icon_button(ui, Icon::Chevron, t.text_dim, "Undo list", vec2(14.0, ch));
-            egui::Popup::menu(&undo_list).show(|ui| {
-                let labels: Vec<String> =
-                    app.session.active().map(|d| d.undo.iter().rev().take(20).map(|e| e.label.clone()).collect()).unwrap_or_default();
-                if labels.is_empty() {
-                    ui.label("Can't Undo");
-                }
-                for (i, l) in labels.iter().enumerate() {
-                    if ui.button(format!("Undo {l}")).clicked() {
-                        app.run_or_alert("edit.undo", json!({"steps": i + 1}));
-                    }
-                }
-            });
-            if icon_button(ui, Icon::Redo, if can_redo { t.text_dim } else { t.text_disabled }, "Redo (⌘Y)", vec2(26.0, ch)).clicked() && can_redo {
-                app.run_or_alert("edit.redo", json!({}));
-            }
-            let more = icon_button(ui, Icon::More, t.text_dim, "More commands", vec2(26.0, ch));
-            egui::Popup::menu(&more).show(|ui| {
-                for (label, id) in [
-                    ("New Workbook", "file.new"),
-                    ("Open…", "file.open"),
-                    ("Save As…", "file.saveAs"),
-                    ("Sort A to Z", "data.sortAscending"),
-                    ("Calculate Now", "formulas.calculateNow"),
-                ] {
-                    if ui.button(label).clicked() {
-                        app.run_or_alert(id, json!({}));
-                    }
-                }
-                if ui.button("Print…").clicked() {
-                    app.print_now(json!({}));
-                }
-            });
             // Centered title.
             let title = app.session.active().map(|d| d.display_title()).unwrap_or_default();
             let dirty = app.session.active().is_some_and(|d| d.is_dirty());
@@ -162,6 +104,70 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
     });
 }
 
+/// The Quick Access Toolbar: AutoSave, Home, Save, Undo (with its list), Redo and More.
+fn quick_access_toolbar(app: &mut SheetApp, ui: &mut Ui, t: &Tokens, ch: f32) {
+    // AutoSave toggle (saves after each change when the workbook has a file).
+    ui.label(egui::RichText::new("AutoSave").font(theme::ui_font(12.5)).color(t.text_dim));
+    let on = app.grid.autosave();
+    let (r, resp) = ui.allocate_exact_size(vec2(30.0, 16.0), Sense::click());
+    ui.painter().rect_filled(r, 8.0, if on { t.accent } else { Color32::TRANSPARENT });
+    ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if on { t.accent } else { t.text_dim }), StrokeKind::Inside);
+    let knob = if on { pos2(r.right() - 8.0, r.center().y) } else { pos2(r.left() + 8.0, r.center().y) };
+    ui.painter().circle_filled(knob, 5.0, if on { Color32::WHITE } else { t.text_dim });
+    if resp.on_hover_text("AutoSave: save after every change (workbooks saved to a file)").clicked() {
+        app.grid.toggle_autosave();
+    }
+    ui.add_space(6.0);
+    let __k = icon_button(ui, Icon::Home, t.text_dim, "Home", vec2(26.0, ch));
+    control_keytip(app, ui, &__k, "start");
+    if __k.clicked() {
+        app.open_dialog("start", json!({}));
+    }
+    if icon_button(ui, Icon::Save, t.text_dim, "Save (⌘S)", vec2(26.0, ch)).clicked()
+        // File operations must include the cell the user is still editing (as the File > Save menu item already does).
+        && app.commit_edit(0, 0, false, false)
+    {
+        app.run_or_alert("file.save", json!({}));
+    }
+    let can_undo = app.session.active().is_some_and(|d| !d.undo.is_empty());
+    let can_redo = app.session.active().is_some_and(|d| !d.redo.is_empty());
+    if icon_button(ui, Icon::Undo, if can_undo { t.text_dim } else { t.text_disabled }, "Undo (⌘Z)", vec2(26.0, ch)).clicked() && can_undo {
+        app.run_or_alert("edit.undo", json!({}));
+    }
+    let undo_list = icon_button(ui, Icon::Chevron, t.text_dim, "Undo list", vec2(14.0, ch));
+    egui::Popup::menu(&undo_list).show(|ui| {
+        let labels: Vec<String> = app.session.active().map(|d| d.undo.iter().rev().take(20).map(|e| e.label.clone()).collect()).unwrap_or_default();
+        if labels.is_empty() {
+            ui.label("Can't Undo");
+        }
+        for (i, l) in labels.iter().enumerate() {
+            if ui.button(format!("Undo {l}")).clicked() {
+                app.run_or_alert("edit.undo", json!({"steps": i + 1}));
+            }
+        }
+    });
+    if icon_button(ui, Icon::Redo, if can_redo { t.text_dim } else { t.text_disabled }, "Redo (⌘Y)", vec2(26.0, ch)).clicked() && can_redo {
+        app.run_or_alert("edit.redo", json!({}));
+    }
+    let more = icon_button(ui, Icon::More, t.text_dim, "More commands", vec2(26.0, ch));
+    egui::Popup::menu(&more).show(|ui| {
+        for (label, id) in [
+            ("New Workbook", "file.new"),
+            ("Open…", "file.open"),
+            ("Save As…", "file.saveAs"),
+            ("Sort A to Z", "data.sortAscending"),
+            ("Calculate Now", "formulas.calculateNow"),
+        ] {
+            if ui.button(label).clicked() {
+                app.run_or_alert(id, json!({}));
+            }
+        }
+        if ui.button("Print…").clicked() {
+            app.print_now(json!({}));
+        }
+    });
+}
+
 pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let collapsed = app.ui.ribbon_collapsed;
@@ -176,15 +182,20 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     ui.add_space(8.0);
-                    file_menu(app, ui);
-                    let mut tabs: Vec<&str> = TABS.to_vec();
-                    let ctx_tabs = contextual_tabs(app);
-                    tabs.extend(ctx_tabs.iter());
-                    for tab in tabs {
+                    if app.embed.backstage {
+                        file_menu(app, ui);
+                    }
+                    // Built-in tabs, then the embedding application's, then the contextual ones.
+                    let mut tabs: Vec<(String, TabKind)> = TABS.iter().map(|t| (t.to_string(), TabKind::BuiltIn)).collect();
+                    tabs.extend(app.host.tabs.iter().map(|t| (t.label.clone(), TabKind::Host(t.keytip.clone()))));
+                    tabs.extend(contextual_tabs(app).into_iter().map(|t| (t.to_string(), TabKind::Contextual)));
+                    for (tab, kind) in &tabs {
+                        let tab = tab.as_str();
                         let active = app.ui.ribbon_tab == tab;
-                        let contextual = ctx_tabs.contains(&tab);
+                        let contextual = matches!(kind, TabKind::Contextual);
                         let font = theme::ui_font(13.5);
-                        let label = app.ui.language.tr(tab);
+                        // Host tabs are named by the host, in its own language.
+                        let label = if matches!(kind, TabKind::Host(_)) { tab } else { app.ui.language.tr(tab) };
                         let tw = ui.painter().layout_no_wrap(label.to_string(), font.clone(), t.text).size().x;
                         let (r, resp) = ui.allocate_exact_size(vec2(tw + 22.0, 30.0), Sense::click());
                         if resp.hovered() && !active {
@@ -213,8 +224,15 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                         if resp.double_clicked() {
                             app.ui.ribbon_collapsed = !collapsed;
                         }
+                        let sequence = match kind {
+                            TabKind::Host(keys) => {
+                                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, label));
+                                keys.as_deref()
+                            }
+                            _ => keytip_table::tab_sequence(tab),
+                        };
                         if app.keytips.prefix() == Some("")
-                            && let Some(sequence) = keytip_table::tab_sequence(tab)
+                            && let Some(sequence) = sequence
                         {
                             keytip(app, ui, sequence, pos2(r.center().x, r.bottom() - 1.0));
                         }
@@ -229,6 +247,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
             ui.painter().rect_filled(card, 10.0, t.ribbon);
             ui.painter().rect_stroke(card, 10.0, Stroke::new(1.0, t.ribbon_border), StrokeKind::Inside);
             let inner = card.shrink2(vec2(10.0, 6.0));
+            let host_tab = app.host.tabs.iter().position(|t| t.label == app.ui.ribbon_tab);
             ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
                 egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -246,12 +265,23 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                             "Table Design" => table_design(app, ui),
                             "Chart Design" => chart_design(app, ui),
                             crate::paper_view::TAB => crate::paper_view::ribbon_tab(app, ui),
-                            _ => home(app, ui),
+                            _ => match host_tab {
+                                Some(index) => crate::host_ribbon::show(app, ui, index),
+                                None => home(app, ui),
+                            },
                         }
                     });
                 });
             });
         });
+}
+
+/// Where a ribbon tab comes from: its label is translated (built-in, contextual) or shown as the
+/// host named it, and its keytip comes from the built-in table or the host.
+enum TabKind {
+    BuiltIn,
+    Host(Option<String>),
+    Contextual,
 }
 
 /// The File tab opens the Backstage view (New, Open, Info, Save As, Print, Export, Options…), like
@@ -295,7 +325,7 @@ fn contextual_tabs(app: &SheetApp) -> Vec<&'static str> {
     v
 }
 
-fn sep(ui: &mut Ui) {
+pub(crate) fn sep(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let (r, _) = ui.allocate_exact_size(vec2(13.0, 72.0), Sense::hover());
     ui.painter().line_segment([pos2(r.center().x, r.top() + 6.0), pos2(r.center().x, r.bottom() - 6.0)], Stroke::new(1.0, t.separator));
@@ -321,7 +351,7 @@ fn act(app: &mut SheetApp, id: &str, params: serde_json::Value) {
 }
 
 /// Keytips are painted, not focusable widgets: the grid retains keyboard focus.
-fn keytip(app: &SheetApp, ui: &Ui, sequence: &str, at: egui::Pos2) {
+pub(crate) fn keytip(app: &SheetApp, ui: &Ui, sequence: &str, at: egui::Pos2) {
     let Some(rest) = app.keytips.prefix().and_then(|prefix| sequence.strip_prefix(prefix)).filter(|s| !s.is_empty()) else { return };
     let t = Tokens::get(ui.ctx());
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("ribbon_keytips"))).with_clip_rect(ui.clip_rect());
@@ -2185,20 +2215,23 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
         );
     });
     ui.vertical(|ui| {
-        ui.label(lang.tr("Display theme"));
-        let mode = app.ui.theme_mode();
-        let label = match mode {
-            "system" => "System",
-            "dark" => "Dark",
-            _ => "Light",
-        };
-        egui::ComboBox::from_id_salt("display_theme").selected_text(lang.tr(label)).width(88.0).show_ui(ui, |ui| {
-            for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
-                if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
-                    act(app, "view.theme", json!({"mode": value}));
+        // Embedded, the host owns light/dark and the interface size (`EmbedOptions::global_style`).
+        if app.embed.global_style {
+            ui.label(lang.tr("Display theme"));
+            let mode = app.ui.theme_mode();
+            let label = match mode {
+                "system" => "System",
+                "dark" => "Dark",
+                _ => "Light",
+            };
+            egui::ComboBox::from_id_salt("display_theme").selected_text(lang.tr(label)).width(88.0).show_ui(ui, |ui| {
+                for (value, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")] {
+                    if ui.selectable_label(mode == value, lang.tr(label)).clicked() {
+                        act(app, "view.theme", json!({"mode": value}));
+                    }
                 }
-            }
-        });
+            });
+        }
         let mut animations = app.ui.animations;
         let hint = lang.tr("Glide the selection outline to the cell you move to instead of jumping there");
         if ui.checkbox(&mut animations, lang.tr("Animations")).on_hover_text(hint).changed() {
@@ -2208,6 +2241,9 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
     sep(ui);
     // Interface size (issue #230): scales the whole window on top of the desktop's scale.
     ui.vertical(|ui| {
+        if !app.embed.global_style {
+            return;
+        }
         ui.label(egui::RichText::new(lang.tr("Interface size")).font(theme::ui_font(11.5)).color(t.text_dim));
         let current = app.ui.interface_scale;
         let text = |v: u16| if v == 100 { lang.tr("Auto").to_string() } else { format!("{v}%") };
