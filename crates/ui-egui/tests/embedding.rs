@@ -172,6 +172,13 @@ fn embedded_sheet_leaves_the_window_chrome_to_the_host() {
     let (top_standalone, top_embedded) = (standalone.state().app.grid.rect.unwrap().top(), embedded.state().app.grid.rect.unwrap().top());
     assert!(top_embedded < top_standalone - 20.0, "{top_embedded} vs {top_standalone}");
     assert!(embedded.state().app.grid.rect.unwrap().left() >= HOST_PANEL, "the sheet stays in its panel");
+    if let (Some(a), Some(b)) = (render(&mut standalone, "standalone"), render(&mut embedded, "embedded")) {
+        // Embedded, the ribbon tabs (the active one underlined in the accent) sit where the
+        // standalone title bar is.
+        let top = Rect::from_min_size(pos2(HOST_PANEL, 0.0), vec2(1280.0 - HOST_PANEL, 52.0));
+        assert_eq!(count(&a, top, Tokens::light().accent), 0, "the standalone title bar has no accent");
+        assert!(count(&b, top, Tokens::light().accent) > 10, "the embedded ribbon starts at the top");
+    }
     let ctx = embedded.ctx.clone();
     let outcome = |h: &mut Harness, method: &str, params: Json| match control::handle(&mut h.state_mut().app, &ctx, method, &params) {
         control::Outcome::Done(v) => v,
@@ -203,12 +210,6 @@ fn embedded_sheet_leaves_the_window_chrome_to_the_host() {
     assert_eq!(outcome(&mut standalone, "engine.execute", json!({"command": "ui.backstage", "params": {"page": "info"}}))["ok"], true);
     standalone.run_steps(2);
     assert!(standalone.state().app.backstage.is_some());
-
-    if let (Some(a), Some(b)) = (render(&mut standalone, "standalone"), render(&mut embedded, "embedded")) {
-        // The standalone title bar (window colour) sits where the embedded ribbon tabs are.
-        let band = Rect::from_min_size(pos2(HOST_PANEL + 40.0, 0.0), vec2(600.0, 30.0));
-        assert!(count(&a, band, Tokens::light().window) > count(&b, band, Tokens::light().window) / 2);
-    }
 }
 
 #[test]
@@ -447,6 +448,15 @@ fn host_tab_buttons_run_commands() {
     let control::Outcome::Done(r) = control::handle(&mut h.state_mut().app, &ctx, "contoso.never", &json!({})) else { panic!() };
     assert_eq!(r["ok"], false, "an unavailable host command reports it");
     assert_eq!(runs.get(), 3);
+
+    // The command search finds host commands under their ribbon tab, and runs them.
+    h.state_mut().app.open_dialog("commandSearch", json!({}));
+    h.state_mut().app.dialog.as_mut().unwrap().search = "stamp".into();
+    h.run_steps(3);
+    h.get_by_label_contains("Stamp Cells").click();
+    h.run_steps(3);
+    assert_eq!(runs.get(), 4);
+    assert!(h.state().app.dialog.is_none());
 
     if let Some(img) = tab {
         // The active host tab's underline is the accent, as for built-in tabs.

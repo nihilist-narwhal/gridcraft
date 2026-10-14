@@ -168,6 +168,10 @@ recursing.
   host a `HostSave { name, bytes, save_as }` (always .xlsx) instead of opening a file picker;
   `Ok` marks the workbook saved, an error is shown and leaves it dirty. A workbook opened from a
   path still saves to that path.
+- Open (Cmd/Ctrl+O, `file.open` without params) calls `Services::open_async` (or `pick_open`)
+  when the host sets it: the host can show its own document browser there and deliver the chosen
+  workbook as `(name, bytes)` through `Services::inbox`, which opens it on the next frame (asking
+  for a password when needed). Without either service, Open does nothing.
 
 ## Revision history
 
