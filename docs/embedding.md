@@ -168,7 +168,9 @@ recursing; one that unregisters itself while it runs is gone once it finishes.
   `password` is an error containing `gridcraft_engine::io::PASSWORD_REQUIRED`. A cell still being
   edited is committed when valid and dropped otherwise.
 - `workbook_bytes(format)` returns `(name, bytes)` for `xlsx`, `csv`, `tsv`, `json` or `html`,
-  committing the cell being edited first.
+  committing the cell being edited first (and showing the user why when that entry is invalid).
+  A host that saves in the background should wait while the user edits a cell
+  (`SheetApp::editor` is `Some`), or the save ends the edit.
 - `mark_saved()` clears the dirty flag once the host has stored the bytes.
 - `Services::save_workbook`: with it, Save on a workbook that has no file, and Save As, hand the
   host a `HostSave { name, bytes, save_as }` (always .xlsx) instead of opening a file picker;
