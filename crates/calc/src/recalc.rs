@@ -1023,6 +1023,11 @@ impl Calc {
                         if let Some(cell) = sheet.cells.get_mut(k.1) {
                             cell.value = Value::Error(CellError::Spill);
                         }
+                        // Blocked only by what was laid out since (another array of this pass):
+                        // the formulas that read the anchor's value in this pass read #SPILL! now.
+                        let mut deps = Vec::new();
+                        self.graph.dependents(k.0, k.1, &mut deps);
+                        spill_changes.extend(deps.into_iter().filter(|d| d != k));
                     } else {
                         for (i, c) in range.iter().enumerate() {
                             if c != k.1 {
@@ -1036,7 +1041,11 @@ impl Calc {
                 if let Some(r) = changed_range {
                     let mut deps = Vec::new();
                     self.graph.dependents_of_range(k.0, r, &mut deps);
-                    spill_changes.extend(deps.into_iter().filter(|d| d != k));
+                    // Not the anchor itself while it spills (that would read its own array), but
+                    // when it no longer does: its new formula may have read the old array, which
+                    // was still laid out while it was evaluated.
+                    let spills = sheet.spill_ranges.contains_key(&k.1);
+                    spill_changes.extend(deps.into_iter().filter(|d| d != k || !spills));
                 }
                 if let Some(o) = old
                     && !sheet.spill_ranges.get(&k.1).is_some_and(|n| n.contains(o.start) && n.contains(o.end))
