@@ -867,12 +867,48 @@ pub fn merge_font_definitions(mut host: FontDefinitions, ours: FontDefinitions) 
     host
 }
 
-/// Whether the context's fonts still carry GridCraft's interface and cell families (a host that
-/// replaces the whole font set drops them; drawing with a missing family would panic in egui).
+/// The named families GridCraft always draws with (interface, cells, serif and monospace).
+pub const ROLES: [&str; 8] = [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO];
+
+/// Whether egui can draw with `family` from `fonts`: the family is bound and every face it names
+/// has font data (egui panics on an unknown family and on a face without data).
+fn family_usable(fonts: &FontDefinitions, family: &FontFamily) -> bool {
+    fonts.families.get(family).is_some_and(|chain| chain.iter().all(|face| fonts.font_data.contains_key(face)))
+}
+
+/// Puts back every family of GridCraft's set `ours` (with its faces) that `fonts` lost or broke,
+/// e.g. in an embedding application's [`crate::Services::fonts`] adjustment: the host may change
+/// faces and their order, never take away a family the sheet draws with.
+pub fn restore_families(fonts: &mut FontDefinitions, ours: &FontDefinitions) {
+    for (family, chain) in &ours.families {
+        if family_usable(fonts, family) {
+            continue;
+        }
+        for face in chain {
+            if let Some(data) = ours.font_data.get(face)
+                && !fonts.font_data.contains_key(face)
+            {
+                fonts.font_data.insert(face.clone(), data.clone());
+            }
+        }
+        fonts.families.insert(family.clone(), chain.clone());
+    }
+}
+
+/// Whether the context's active fonts still bind every family the sheet draws with: GridCraft's
+/// [`ROLES`] and the workbook fonts bound with them. A host that replaces the whole font set drops
+/// them, and drawing with a missing family would panic in egui.
 pub fn fonts_installed(ctx: &egui::Context) -> bool {
+    families_installed(ctx, true)
+}
+
+/// [`fonts_installed`], optionally without the workbook font families (whose registry is
+/// process-wide, see [`crate::fonts::is_bound`]).
+pub(crate) fn families_installed(ctx: &egui::Context, workbook_fonts: bool) -> bool {
+    let bound = if workbook_fonts { crate::fonts::bound_families() } else { Vec::new() };
     ctx.fonts(|f| {
-        let families = &f.definitions().families;
-        [UI, UI_BOLD, CELL].iter().all(|role| families.get(&FontFamily::Name((*role).into())).is_some_and(|chain| !chain.is_empty()))
+        let fonts = f.definitions();
+        ROLES.iter().map(|role| (*role).to_string()).chain(bound).all(|name| family_usable(fonts, &FontFamily::Name(name.into())))
     })
 }
 

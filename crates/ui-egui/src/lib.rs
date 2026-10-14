@@ -203,12 +203,13 @@ pub struct Services {
     /// no intermediate file) — opens the system print dialog on that PDF.
     pub print: Option<Box<dyn Fn(&[u8])>>,
     /// Embedding: keep a keyboard event for the host. Asked for every key, text, copy, cut and
-    /// paste event while the sheet has the keyboard; `true` hides the event from the sheet (host
-    /// widgets drawn after [`SheetApp::ui`] still get it). See also
+    /// paste event while the sheet has the keyboard; `true` hides the event, and the text its key
+    /// types, from the sheet (host widgets drawn after [`SheetApp::ui`] still get them). See also
     /// [`embed::EmbedOptions::reserved_shortcuts`].
     pub keep_key: Option<Box<dyn FnMut(&egui::Event) -> bool>>,
     /// Embedding: adjust the font set GridCraft installs, e.g. put the host's typeface first in
-    /// the `ui` family ([`theme::UI`]). GridCraft's named families must stay bound.
+    /// the `ui` family ([`theme::UI`]). A family the sheet draws with that the adjustment drops
+    /// (or leaves naming a face without data) is put back as GridCraft built it.
     pub fonts: Option<Box<dyn Fn(&mut egui::FontDefinitions)>>,
     /// Embedding: the host stores workbooks itself. Save on a workbook without a file, and Save
     /// As, hand it the .xlsx bytes instead of asking for a path; `Ok` marks the workbook saved.
@@ -785,7 +786,12 @@ impl SheetApp {
     /// Opens the File tab's Backstage view on `page`, committing a cell still being edited first
     /// (File actions work on the whole workbook). A draft that can't be committed keeps the sheet.
     pub fn open_backstage(&mut self, page: backstage::Page) {
-        if !self.embed.backstage || !self.commit_edit(0, 0, false, false) {
+        if !self.embed.backstage {
+            // Embedded without it (File › Options, a keytip): say so instead of doing nothing.
+            self.toast = Some(("The File view is not available here".into(), now_ms()));
+            return;
+        }
+        if !self.commit_edit(0, 0, false, false) {
             return;
         }
         match &mut self.backstage {
@@ -1097,11 +1103,14 @@ impl SheetApp {
             self.fonts_ready = false;
             self.fonts_set = false;
         }
-        // Embedded, the host may replace the whole font set: install GridCraft's families again
-        // before anything draws with them (egui panics on a family it doesn't know).
-        if !self.embed.global_style && self.fonts_ready && !self.fonts_rebind && !theme::fonts_installed(ctx) {
+        // The set installed last frame (or earlier) is the active one now, unless something else
+        // replaced it since: an embedding application's own `set_fonts`, before or after the sheet
+        // drew. Install GridCraft's families again before anything draws with them (egui panics
+        // on a family it doesn't know). Embedded, the workbook fonts' families are checked too.
+        if self.fonts_set && !theme::families_installed(ctx, !self.embed.global_style) {
             self.fonts_ready = false;
             self.fonts_set = false;
+            self.fonts_rebind = false;
         }
         if !self.fonts_ready {
             // New fonts apply from the next frame on: paint nothing until then.
@@ -1143,12 +1152,13 @@ impl SheetApp {
     /// Hands GridCraft's font set (with the workbook fonts in `used`) to egui: merged into the
     /// host's when embedded without the global style, adjusted by the host's `fonts` service.
     fn install_fonts(&self, ctx: &egui::Context, used: &[String]) {
-        let mut fonts = theme::font_definitions_with(self.ui.language, used);
-        if !self.embed.global_style {
-            fonts = theme::merge_font_definitions(ctx.fonts(|f| f.definitions().clone()), fonts);
-        }
-        if let Some(adjust) = &self.services.fonts {
+        let ours = theme::font_definitions_with(self.ui.language, used);
+        // The host's adjustment may not take away a family the sheet draws with.
+        let keep = self.services.fonts.is_some().then(|| ours.clone());
+        let mut fonts = if self.embed.global_style { ours } else { theme::merge_font_definitions(ctx.fonts(|f| f.definitions().clone()), ours) };
+        if let (Some(adjust), Some(ours)) = (&self.services.fonts, &keep) {
             adjust(&mut fonts);
+            theme::restore_families(&mut fonts, ours);
         }
         ctx.set_fonts(fonts);
     }

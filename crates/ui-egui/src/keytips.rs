@@ -52,6 +52,12 @@ impl KeyTips {
         self.held.clear();
     }
 
+    /// Another key went down while Alt was held (one the sheet never sees, e.g. a shortcut the
+    /// embedding application keeps): releasing Alt is not a keytip tap.
+    pub(crate) fn interrupt(&mut self) {
+        self.alt_armed = false;
+    }
+
     fn toggle(&mut self) {
         self.prefix = if self.prefix.is_some() { None } else { Some(String::new()) };
         self.alt_armed = false;

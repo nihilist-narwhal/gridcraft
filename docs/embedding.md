@@ -1,6 +1,6 @@
 # Embedding the sheet in another application
 
-> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** major (created: embed options, keyboard, host theme, host ribbon tabs and commands, workbook bytes)
+> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (keyboard and font fixes from review: focus moves inside the sheet, kept keys keep their text, quit shortcuts, host font sets)
 
 `gridcraft-ui-egui`'s `SheetApp::ui(&mut egui::Ui)` draws the whole spreadsheet into any egui
 region. An egui application (the *host*) can show it as one panel of its own window, in its own
@@ -51,7 +51,7 @@ and a sample `Contoso` tab) offscreen.
 |---|---|---|---|
 | `title_bar` | on | off | no title bar (title, Search, Share, Comments, light/dark switch) |
 | `quick_access_toolbar` | on | off | no AutoSave/Home/Save/Undo/Redo/More (they live in the title bar) |
-| `backstage` | on | off | no File tab; `ui.backstage` and File › Options report that the host has no File view; Print prints directly |
+| `backstage` | on | off | no File tab; `ui.backstage` returns an error and File › Options shows a notice that there is no File view; Print prints directly |
 | `status_bar` | on | off | no status bar (the user's View setting applies when on) |
 | `window_controls` | on | off | no window title, no drag/maximize from the title bar; `ui.resize`, `ui.focus` and `app.quit` are refused on the control channel |
 | `global_style` | on | off | see below |
@@ -71,9 +71,10 @@ visuals, spacing and fonts. Off, it leaves all of that to the host:
   (`theme::sheet_style`); the host's widgets, and popups and dialogs, keep the host's style;
 - GridCraft's fonts are *merged* into the host's font set: the host keeps its font data and its
   proportional and monospace families, GridCraft adds its named families (`ui`, `cell`, …). If
-  the host later replaces the whole font set, the sheet installs its families again before it
-  draws. `Services::fonts` can adjust the set (for example put the host's typeface first in the
-  `ui` family).
+  the host later replaces the whole font set (before or after the sheet draws, in any frame),
+  the sheet installs its families again before it draws. `Services::fonts` can adjust the set
+  (for example put the host's typeface first in the `ui` family); a family the sheet draws with
+  that the adjustment drops is put back.
 
 Call `SheetApp::logic` before `SheetApp::ui` every frame; don't call `setup_context*` (that is
 the standalone app's start-up).
@@ -85,7 +86,9 @@ With `KeyboardScope::Focus` the sheet handles keys only while it *has the keyboa
 - a press inside the sheet's region gives it the keyboard; a press elsewhere in the host takes it
   away. A press on one of the sheet's dialogs keeps it with the sheet; menus leave it where it
   was;
-- a host widget that takes egui's focus (Tab, or the host's `request_focus`) takes the keyboard;
+- a host widget that takes egui's focus (Tab, or the host's `request_focus`) takes the keyboard.
+  Focus that egui moves between the sheet's own widgets (Shift+Tab between the fields of one of
+  its dialogs) leaves it with the sheet;
 - `SheetApp::focus_keyboard()` / `release_keyboard()` hand it over explicitly, and
   `has_keyboard()` tells who has it. Keys sent over the control channel give it to the sheet.
 
@@ -103,7 +106,10 @@ even then:
 - `Services::keep_key`: a callback asked for every keyboard event while the sheet has the
   keyboard; `true` keeps the event for the host.
 
-Reserved events never reach the sheet and are back in the frame's input after `SheetApp::ui`.
+A key kept either way keeps the text it types (a reserved `/` doesn't start an edit with `/`), and
+a kept Alt+key doesn't leave the sheet taking the Alt release for a keytip tap. egui's own quit
+shortcuts (`Options::quit_shortcuts`, Cmd/Ctrl+Q by default) are always the host's. Reserved
+events never reach the sheet and are back in the frame's input after `SheetApp::ui`.
 
 ## Colours: `HostTheme`
 
@@ -153,7 +159,7 @@ the params and `.enabled_when(f)` makes it unavailable (greyed out buttons, an e
 A host command runs through `SheetApp::run` like a built-in one, so ribbon buttons, keytips, the
 command search, `engine.execute` and `engine.commands` on the control channel (`"host": true`,
 with its ribbon path) all reach it. A command that runs itself again gets an error instead of
-recursing.
+recursing; one that unregisters itself while it runs is gone once it finishes.
 
 ## Workbooks the host stores
 
@@ -173,8 +179,19 @@ recursing.
   workbook as `(name, bytes)` through `Services::inbox`, which opens it on the next frame (asking
   for a password when needed). Without either service, Open does nothing.
 
+## Agents and the control channel
+
+Everything the sheet can do is a command, so a host's own agent integration can call
+`SheetApp::run(id, params)` directly. To serve the control channel ([`control-protocol.md`](control-protocol.md))
+the host sets `SheetApp::control_rx` to a receiver of `ControlRequest`s from a transport of its
+own (the standalone app's localhost server lives in `apps/gridcraft`); `SheetApp::logic` answers
+them. Synthetic input (`ui.click`, `ui.text`, `ui.key`, …) reaches the sheet only when the host's
+`eframe::App::raw_input_hook` calls `SheetApp::raw_input_hook`; keys sent that way give the sheet
+the keyboard.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-14 | major | Created: embed options, keyboard scope and reserved shortcuts, host theme, host ribbon tabs and commands, workbook bytes in and out |
+| 2026-10-14 | minor | Review fixes: Shift+Tab inside the sheet's dialogs keeps the keyboard, kept keys keep their text and don't arm keytips, quit shortcuts stay the host's, host font sets and `Services::fonts` can't remove the sheet's families, a running command can unregister itself; agents and the control channel |

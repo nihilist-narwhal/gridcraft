@@ -322,6 +322,11 @@ pub fn is_bound(role: &str) -> bool {
     bound().read().unwrap_or_else(|e| e.into_inner()).contains(role)
 }
 
+/// The role families currently recorded as bound.
+pub(crate) fn bound_families() -> Vec<String> {
+    bound().read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+}
+
 /// Serializes tests that mutate the process-wide bound-family registry.
 #[cfg(test)]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

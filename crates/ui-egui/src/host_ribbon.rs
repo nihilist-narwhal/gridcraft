@@ -311,10 +311,11 @@ pub(crate) fn show(app: &mut SheetApp, ui: &mut Ui, index: usize) {
             tab.draw = Some(draw);
         }
     }
-    if let Some((group, button)) = pressed
-        && let Some(tab) = app.host.tabs.iter().position(|t| t.label == label)
+    // The button that was drawn and clicked, even if the draw callback replaced the tab meanwhile.
+    if let Some(b) = pressed.and_then(|(group, button)| groups.get(group).and_then(|g| g.get(button)))
+        && app.command_enabled(&b.command)
     {
-        app.press_host_button(tab, group, button);
+        app.run_or_alert(&b.command, b.params.clone());
     }
 }
 

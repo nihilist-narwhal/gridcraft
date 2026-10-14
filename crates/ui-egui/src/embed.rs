@@ -50,7 +50,9 @@ pub struct EmbedOptions {
     /// Shortcuts the host keeps for itself: the sheet never sees them, even while it has the
     /// keyboard (e.g. the host's own Cmd/Ctrl+S). Matched exactly (Shift and Alt must match;
     /// `COMMAND` is Cmd on macOS and Ctrl elsewhere). Cmd/Ctrl+C, X and V also keep the copy,
-    /// cut and paste events. For decisions per event, see [`crate::Services::keep_key`].
+    /// cut and paste events, and a key that types text keeps its text. egui's quit shortcuts
+    /// (`Options::quit_shortcuts`) are always the host's. For decisions per event, see
+    /// [`crate::Services::keep_key`].
     pub reserved_shortcuts: Vec<KeyboardShortcut>,
 }
 
@@ -160,6 +162,9 @@ pub(crate) struct Host {
     /// The host handed the keyboard over ([`SheetApp::focus_keyboard`]): its own widget lets go
     /// of egui's focus at the next frame.
     pub(crate) focus_requested: bool,
+    /// Host commands running now (taken out of `commands` while they run), innermost last, and
+    /// whether each was unregistered meanwhile (then it doesn't come back when it finishes).
+    pub(crate) running: Vec<(String, bool)>,
 }
 
 /// The longest command id a host may register.
@@ -206,6 +211,24 @@ fn check_command_id(id: &str) -> Result<(), String> {
 /// Keyboard events: what [`KeyboardScope::Focus`] and reserved shortcuts hold back.
 fn is_keyboard(e: &Event) -> bool {
     matches!(e, Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_) | Event::Ime(_))
+}
+
+/// The text event that the key press at `key` typed: the text right after it (native order), or
+/// right before it (browsers) when that text doesn't follow a key press of its own. Keys held
+/// with Cmd or Ctrl type nothing.
+fn typed_text(events: &[Event], key: usize) -> Option<usize> {
+    let Some(Event::Key { pressed: true, modifiers, .. }) = events.get(key) else { return None };
+    if modifiers.command || modifiers.ctrl || modifiers.mac_cmd {
+        return None;
+    }
+    let skip = |i: &usize| !matches!(events.get(*i), Some(Event::ModifiersChanged(_)));
+    let after = (key + 1..events.len()).find(skip);
+    if let Some(i) = after.filter(|i| matches!(events.get(*i), Some(Event::Text(_)))) {
+        return Some(i);
+    }
+    let before = (0..key).rev().find(skip).filter(|i| matches!(events.get(*i), Some(Event::Text(_))))?;
+    let owner = (0..before).rev().find(skip);
+    (!owner.is_some_and(|i| matches!(events.get(i), Some(Event::Key { pressed: true, .. })))).then_some(before)
 }
 
 /// Whether `e` is one of the host's reserved shortcuts.
@@ -261,15 +284,25 @@ impl SheetApp {
         Ok(())
     }
 
-    /// Removes a host command; `false` when there was none with this id.
+    /// Removes a host command (also one that is running: it is gone once it finishes); `false`
+    /// when there was none with this id.
     pub fn unregister_command(&mut self, id: &str) -> bool {
+        if let Some(running) = self.host.running.iter_mut().rev().find(|(r, dropped)| r == id && !dropped) {
+            running.1 = true;
+            return true;
+        }
         let before = self.host.commands.len();
         self.host.commands.retain(|c| c.id != id);
         self.host.commands.len() != before
     }
 
     pub fn has_host_command(&self, id: &str) -> bool {
-        self.host.commands.iter().any(|c| c.id == id)
+        self.host.commands.iter().any(|c| c.id == id) || self.running_command(id)
+    }
+
+    /// A host command with this id is running and still registered.
+    fn running_command(&self, id: &str) -> bool {
+        self.host.running.iter().any(|(r, dropped)| r == id && !dropped)
     }
 
     /// The host commands as the control channel lists commands (`engine.commands`).
@@ -311,15 +344,21 @@ impl SheetApp {
     /// Runs a host command, if `id` names one. The command is taken out while it runs, so a
     /// command that runs itself again gets an error instead of recursing.
     pub(crate) fn run_host_command(&mut self, id: &str, params: &Json) -> Option<Result<Json, String>> {
+        if self.running_command(id) {
+            return Some(Err(format!("command `{id}` is already running")));
+        }
         let index = self.host.commands.iter().position(|c| c.id == id)?;
         if !self.host.commands.get(index).is_some_and(|c| c.enabled.as_ref().is_none_or(|f| f(self))) {
             return Some(Err(format!("command `{id}` is not available right now")));
         }
         let mut command = self.host.commands.remove(index);
+        self.host.running.push((command.id.clone(), false));
         let result = (command.run)(self, params);
-        // The command may have registered or removed commands meanwhile; keep its slot unless
-        // something else took the id.
-        if !self.has_host_command(&command.id) {
+        // Runs nest, so this one is the innermost again.
+        let dropped = self.host.running.pop().is_some_and(|(_, dropped)| dropped);
+        // The command may have registered or removed commands meanwhile; keep its slot unless it
+        // was unregistered or something else took the id.
+        if !dropped && !self.host.commands.iter().any(|c| c.id == command.id) {
             let at = index.min(self.host.commands.len());
             self.host.commands.insert(at, command);
         }
@@ -356,17 +395,20 @@ impl SheetApp {
         }
         let ctx = ui.ctx();
         if std::mem::take(&mut self.host.focus_requested) {
-            ctx.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
-                }
-            });
-            self.host.focus_seen = None;
-        } else if self.host.keyboard {
-            let focused = ctx.memory(|m| m.focused());
-            if focused.is_some() && focused != self.host.focus_seen {
-                self.release_keyboard();
+            // A host widget lets go of egui's focus; one of the sheet's own (the cell being
+            // edited) keeps it.
+            if let Some(id) = ctx.memory(|m| m.focused())
+                && !self.owns_focus(ui, id)
+            {
+                ctx.memory_mut(|m| m.surrender_focus(id));
             }
+            self.host.focus_seen = ctx.memory(|m| m.focused());
+        } else if self.host.keyboard
+            && let Some(focused) = ctx.memory(|m| m.focused())
+            && Some(focused) != self.host.focus_seen
+            && !self.owns_focus(ui, focused)
+        {
+            self.release_keyboard();
         }
         let Some(pos) = ctx.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin().or(i.pointer.interact_pos()) } else { None }) else {
             return;
@@ -392,20 +434,63 @@ impl SheetApp {
         }
     }
 
+    /// Whether the widget that took egui's focus since the sheet last drew is one of the sheet's
+    /// own. egui itself moves focus between frames on keys the sheet saw (Shift+Tab between the
+    /// fields of a dialog, arrows on a focused button): a move that stays inside the sheet's
+    /// region, or inside the window the focus was in (one of the sheet's dialogs), keeps the
+    /// keyboard with the sheet. Anything else is a host widget.
+    fn owns_focus(&self, ui: &egui::Ui, id: egui::Id) -> bool {
+        let ctx = ui.ctx();
+        let Some(now) = ctx.read_response(id) else { return false };
+        if now.layer_id == ui.layer_id() {
+            return ui.max_rect().intersect(ui.clip_rect()).contains(now.rect.center());
+        }
+        self.host.focus_seen.and_then(|seen| ctx.read_response(seen)).is_some_and(|seen| seen.layer_id == now.layer_id)
+    }
+
     /// Takes the keyboard events the sheet must not see out of this frame's input: all of them
-    /// without the keyboard, the host's reserved ones with it. [`Self::restore_keys`] gives them
+    /// without the keyboard, the host's reserved ones with it. [`Self::finish_keys`] gives them
     /// back after the sheet has drawn, so host widgets drawn later still get them.
     pub(crate) fn withhold_keys(&mut self, ctx: &egui::Context) -> Vec<Event> {
         let all = !self.has_keyboard();
-        if !all && self.embed.reserved_shortcuts.is_empty() && self.services.keep_key.is_none() {
+        // egui's own quit shortcuts (Cmd/Ctrl+Q by default) are the host window's.
+        let quit = if self.embed.keyboard == KeyboardScope::Focus { ctx.options(|o| o.quit_shortcuts.clone()) } else { Vec::new() };
+        if !all && self.embed.reserved_shortcuts.is_empty() && quit.is_empty() && self.services.keep_key.is_none() {
             return Vec::new();
         }
         let events = ctx.input_mut(|i| std::mem::take(&mut i.events));
         let reserved = &self.embed.reserved_shortcuts;
         let mut keep = self.services.keep_key.take();
-        let (withheld, rest): (Vec<Event>, Vec<Event>) =
-            events.into_iter().partition(|e| is_keyboard(e) && (all || is_reserved(reserved, e) || keep.as_mut().is_some_and(|f| f(e))));
+        let mut held: Vec<bool> = events
+            .iter()
+            .map(|e| is_keyboard(e) && (all || is_reserved(reserved, e) || is_reserved(&quit, e) || keep.as_mut().is_some_and(|f| f(e))))
+            .collect();
         self.services.keep_key = keep;
+        if !all {
+            // A key the host keeps takes the text it types along (a reserved "/" must not start
+            // an edit with "/").
+            let typed: Vec<usize> = (0..events.len()).filter(|&i| held.get(i) == Some(&true)).filter_map(|i| typed_text(&events, i)).collect();
+            for text in typed {
+                if let Some(h) = held.get_mut(text) {
+                    *h = true;
+                }
+            }
+            // An Alt+key the host keeps: the sheet must not take the Alt release that follows for
+            // a keytip tap (Windows and Linux), so it doesn't see this frame's Alt either.
+            let alt_kept = events.iter().zip(&held).any(|(e, h)| *h && matches!(e, Event::Key { pressed: true, modifiers, .. } if modifiers.alt));
+            if alt_kept {
+                self.keytips.interrupt();
+                for (e, h) in events.iter().zip(held.iter_mut()) {
+                    if matches!(e, Event::Key { key: Key::AltLeft | Key::AltRight, .. }) {
+                        *h = true;
+                    }
+                }
+            }
+        }
+        let (mut withheld, mut rest) = (Vec::new(), Vec::new());
+        for (e, h) in events.into_iter().zip(held) {
+            if h { withheld.push(e) } else { rest.push(e) }
+        }
         ctx.input_mut(|i| i.events = rest);
         withheld
     }
@@ -529,5 +614,24 @@ mod tests {
         assert!(is_reserved(&reserved, &Event::Copy));
         assert!(!is_reserved(&reserved, &Event::Cut));
         assert!(!is_reserved(&reserved, &Event::Text("s".into())));
+    }
+
+    #[test]
+    fn a_kept_key_takes_the_text_it_typed() {
+        let key = |key, pressed, modifiers| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+        let text = |t: &str| Event::Text(t.into());
+        // Native order: key, then its text.
+        let native = [key(Key::A, true, Modifiers::NONE), text("a"), key(Key::Slash, true, Modifiers::NONE), text("/")];
+        assert_eq!(typed_text(&native, 2), Some(3));
+        assert_eq!(typed_text(&native, 0), Some(1));
+        // Browser order: the text first; text that follows another key press is that key's.
+        let web = [text("/"), Event::ModifiersChanged(Modifiers::NONE), key(Key::Slash, true, Modifiers::NONE)];
+        assert_eq!(typed_text(&web, 2), Some(0));
+        let other = [key(Key::A, true, Modifiers::NONE), text("a"), key(Key::F2, true, Modifiers::NONE)];
+        assert_eq!(typed_text(&other, 2), None, "F2 typed nothing; the a is A's");
+        // Releases and Cmd/Ctrl shortcuts type nothing.
+        assert_eq!(typed_text(&[key(Key::S, false, Modifiers::NONE), text("s")], 0), None);
+        assert_eq!(typed_text(&[key(Key::S, true, Modifiers::COMMAND), text("s")], 0), None);
+        assert_eq!(typed_text(&[key(Key::S, true, Modifiers::NONE)], 5), None);
     }
 }

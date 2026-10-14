@@ -5,7 +5,9 @@
 //! `GRIDCRAFT_EMBED_SNAPSHOTS=<dir>` to write the renders there and look at them.
 
 use std::cell::{Cell, RefCell};
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{Color32, Event, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::kittest::Queryable as _;
@@ -25,6 +27,11 @@ struct Host {
     note_rect: Rect,
     /// Cmd/Ctrl+S presses the host handled itself, after the sheet.
     host_saves: usize,
+    /// egui's quit shortcut (Cmd/Ctrl+Q), as the host window sees it after the sheet.
+    host_quits: usize,
+    frame: u32,
+    /// Frames after whose sheet the host installs a font set of its own.
+    host_fonts_on: Vec<u32>,
 }
 
 type Harness = egui_kittest::Harness<'static, Host>;
@@ -38,10 +45,11 @@ fn session() -> Session {
 }
 
 fn harness(app: SheetApp) -> Harness {
-    let host = Host { app, note: String::new(), note_rect: Rect::NOTHING, host_saves: 0 };
+    let host = Host { app, note: String::new(), note_rect: Rect::NOTHING, host_saves: 0, host_quits: 0, frame: 0, host_fonts_on: Vec::new() };
     let mut h = egui_kittest::Harness::builder().with_size(vec2(1280.0, 800.0)).build_ui_state(
         |ui, host: &mut Host| {
             let ctx = ui.ctx().clone();
+            host.frame += 1;
             host.app.logic(&ctx);
             egui::Panel::left("host_panel").exact_size(HOST_PANEL).show(ui, |ui| {
                 ui.label("Host navigation");
@@ -52,6 +60,12 @@ fn harness(app: SheetApp) -> Harness {
             if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
                 host.host_saves += 1;
             }
+            if ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Key { key: Key::Q, pressed: true, modifiers, .. } if modifiers.command))) {
+                host.host_quits += 1;
+            }
+            if host.host_fonts_on.contains(&host.frame) {
+                ctx.set_fonts(host_fonts());
+            }
         },
         host,
     );
@@ -59,6 +73,15 @@ fn harness(app: SheetApp) -> Harness {
     h.ctx.set_theme(egui::Theme::Light);
     h.run_steps(4);
     h
+}
+
+/// A host's own font set: egui's, with the proportional faces in another order.
+fn host_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(chain) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        chain.reverse();
+    }
+    fonts
 }
 
 fn embedded(services: Services) -> SheetApp {
@@ -133,18 +156,30 @@ fn palette() -> (Palette, Palette) {
     (light, dark)
 }
 
-/// Renders the harness when a GPU adapter is available (saving the PNG when asked to).
+/// Renders the harness when a GPU adapter is available (saving the PNG when asked to). Without
+/// one, egui_kittest's renderer panics while it starts: that is caught, and the rendered checks
+/// of every test are skipped from then on.
 fn render(h: &mut Harness, name: &str) -> Option<image::RgbaImage> {
-    match h.render() {
-        Ok(img) => {
+    static NO_RENDERER: AtomicBool = AtomicBool::new(false);
+    if NO_RENDERER.load(Ordering::Relaxed) {
+        return None;
+    }
+    match std::panic::catch_unwind(AssertUnwindSafe(|| h.render())) {
+        Ok(Ok(img)) => {
             if let Ok(dir) = std::env::var("GRIDCRAFT_EMBED_SNAPSHOTS") {
                 let _ = std::fs::create_dir_all(&dir);
                 img.save(std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
             }
             Some(img)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("no GPU renderer ({e}); skipping the rendered checks for {name}");
+            NO_RENDERER.store(true, Ordering::Relaxed);
+            None
+        }
+        Err(_) => {
+            eprintln!("no GPU adapter; skipping the rendered checks for {name}");
+            NO_RENDERER.store(true, Ordering::Relaxed);
             None
         }
     }
@@ -195,6 +230,10 @@ fn embedded_sheet_leaves_the_window_chrome_to_the_host() {
         assert_eq!(outcome(&mut embedded, method, params)["ok"], false, "{method}");
     }
     assert!(embedded.state().app.backstage.is_none());
+    // File › Options (the command, a keytip) says there is no File view instead of doing nothing.
+    embedded.state_mut().app.run_or_alert("file.options", json!({}));
+    assert!(embedded.state().app.backstage.is_none());
+    assert!(embedded.state().app.toast.as_ref().is_some_and(|(m, _)| m.contains("File view")));
     // The host's global style, zoom and fonts stay the host's.
     assert_eq!(embedded.ctx.global_style().visuals.panel_fill, egui::Visuals::light().panel_fill);
     assert_eq!(embedded.ctx.zoom_factor(), 1.0);
@@ -278,6 +317,154 @@ fn keyboard_belongs_to_the_panel_the_user_clicked() {
     assert!(h.state().app.has_keyboard());
     h.state_mut().app.release_keyboard();
     assert!(!h.state().app.has_keyboard());
+}
+
+#[test]
+fn keys_stay_with_the_panel_that_owns_them() {
+    let mut app = embedded(Services::default());
+    app.embed.reserved_shortcuts.extend([KeyboardShortcut::new(Modifiers::NONE, Key::Slash), KeyboardShortcut::new(Modifiers::ALT, Key::Num1)]);
+    let mut h = harness(app);
+    // Alt alone opens keytips on Windows and Linux.
+    h.ctx.set_os(egui::os::OperatingSystem::Windows);
+    let grid = grid_point(&h);
+    click_at(&mut h, grid);
+    assert!(h.state().app.has_keyboard());
+
+    // Tab and the arrows move the selection; the keyboard stays with the sheet.
+    let before = h.state().app.session.active().unwrap().selection.active;
+    key(&mut h, Key::Tab, Modifiers::NONE);
+    key(&mut h, Key::ArrowDown, Modifiers::NONE);
+    let after = h.state().app.session.active().unwrap().selection.active;
+    assert_eq!((after.row, after.col), (before.row + 1, before.col + 1));
+    assert!(h.state().app.has_keyboard());
+
+    // egui's quit shortcut is the host window's, even while the sheet has the keyboard.
+    key(&mut h, Key::Q, Modifiers::COMMAND);
+    assert_eq!(h.state().host_quits, 1);
+
+    // A reserved key keeps the text it types: "/" doesn't start an edit.
+    h.input_mut().events.extend([
+        Event::Key { key: Key::Slash, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+        Event::Text("/".into()),
+        Event::Key { key: Key::Slash, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+    ]);
+    h.run_steps(2);
+    assert!(h.state().app.editor.is_none(), "the reserved key's text went to the host");
+
+    // A reserved Alt+1: releasing Alt afterwards is not a keytip tap.
+    for (k, pressed, modifiers) in [
+        (Key::AltLeft, true, Modifiers::ALT),
+        (Key::Num1, true, Modifiers::ALT),
+        (Key::Num1, false, Modifiers::ALT),
+        (Key::AltLeft, false, Modifiers::NONE),
+    ] {
+        h.input_mut().events.push(Event::Key { key: k, physical_key: None, pressed, repeat: false, modifiers });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    assert!(h.state().app.keytips.prefix().is_none(), "the host's Alt+1 doesn't open the sheet's keytips");
+    // The same in one frame.
+    h.input_mut().events.extend(
+        [(Key::AltLeft, true, Modifiers::ALT), (Key::Num1, true, Modifiers::ALT), (Key::AltLeft, false, Modifiers::NONE)]
+            .map(|(k, pressed, modifiers)| Event::Key { key: k, physical_key: None, pressed, repeat: false, modifiers }),
+    );
+    h.run_steps(2);
+    assert!(h.state().app.keytips.prefix().is_none());
+    // A plain Alt tap still opens them.
+    for (pressed, modifiers) in [(true, Modifiers::ALT), (false, Modifiers::NONE)] {
+        h.input_mut().events.push(Event::Key { key: Key::AltLeft, physical_key: None, pressed, repeat: false, modifiers });
+        h.run_steps(1);
+    }
+    assert_eq!(h.state().app.keytips.prefix(), Some(""));
+    key(&mut h, Key::Escape, Modifiers::NONE);
+
+    // Shift+Tab between the fields of the sheet's own dialog keeps the keyboard with the sheet
+    // (egui moves that focus between frames).
+    h.state_mut().app.open_dialog("find", json!({"replace": true}));
+    h.run_steps(3);
+    let fields: Vec<Rect> = h.query_all_by_role(egui::accesskit::Role::TextInput).map(|n| n.rect()).collect();
+    let (find_what, replace_with) = (fields[fields.len() - 2], fields[fields.len() - 1]);
+    assert!(find_what.left() > HOST_PANEL && replace_with.top() > find_what.top(), "the dialog's two fields");
+    click_at(&mut h, find_what.center());
+    type_text(&mut h, "a");
+    key(&mut h, Key::Tab, Modifiers::NONE);
+    type_text(&mut h, "b");
+    key(&mut h, Key::Tab, Modifiers::SHIFT);
+    assert!(h.state().app.has_keyboard(), "Shift+Tab inside the dialog");
+    type_text(&mut h, "c");
+    let d = h.state().app.dialog.as_ref().unwrap();
+    assert_eq!((&d.values["what"], &d.values["with"]), (&json!("ac"), &json!("b")));
+    assert_eq!(h.state().note, "", "the host's field got nothing");
+}
+
+#[test]
+fn host_font_changes_never_crash_the_sheet() {
+    // The host installs its own font set after the sheet drew, in the frame the sheet installed
+    // its families, and again for a few frames.
+    let mut h = harness(embedded(Services::default()));
+    let frame = h.state().frame;
+    h.state_mut().host_fonts_on = vec![frame + 1, frame + 3, frame + 4, frame + 5];
+    h.run_steps(10);
+    assert!(theme::fonts_installed(&h.ctx), "the sheet's families came back");
+    let mut fresh = egui_kittest::Harness::builder().with_size(vec2(1280.0, 800.0)).build_ui_state(
+        |ui, host: &mut Host| {
+            host.frame += 1;
+            host.app.logic(ui.ctx());
+            egui::CentralPanel::default().show(ui, |ui| host.app.ui(ui));
+            if host.frame == 1 {
+                // The host's own start-up, after the sheet's first frame.
+                ui.ctx().set_fonts(host_fonts());
+            }
+        },
+        Host {
+            app: embedded(Services::default()),
+            note: String::new(),
+            note_rect: Rect::NOTHING,
+            host_saves: 0,
+            host_quits: 0,
+            frame: 0,
+            host_fonts_on: Vec::new(),
+        },
+    );
+    fresh.run_steps(8);
+    assert!(theme::fonts_installed(&fresh.ctx));
+    assert!(fresh.state().app.grid.rect.is_some(), "the sheet draws");
+
+    // A `fonts` service that drops a family the sheet draws with gets it put back.
+    let services = Services {
+        fonts: Some(Box::new(|f: &mut egui::FontDefinitions| {
+            f.families.remove(&egui::FontFamily::Name(theme::MONO.into()));
+            f.families.remove(&egui::FontFamily::Name(theme::UI.into()));
+        })),
+        ..Default::default()
+    };
+    for app in [
+        embedded(services),
+        SheetApp::new(session(), Services { fonts: Some(Box::new(|f: &mut egui::FontDefinitions| f.families.clear())), ..Default::default() }),
+    ] {
+        let mut h = harness(app);
+        h.state_mut().app.run("cell.set", json!({"cell": "A1", "input": "=1+1"})).unwrap();
+        h.state_mut().app.run("formulas.showFormulas", json!({})).ok();
+        h.run_steps(4);
+        assert!(theme::fonts_installed(&h.ctx));
+    }
+}
+
+#[test]
+fn a_running_host_command_can_unregister_itself() {
+    let mut app = embedded(Services::default());
+    app.register_command(HostCommand::new("contoso.once", "Once", |app, _| {
+        assert!(app.has_host_command("contoso.once"));
+        assert!(app.register_command(HostCommand::new("contoso.once", "Twice", |_, _| Ok(Json::Null))).is_err(), "still registered");
+        assert_eq!(app.run("contoso.once", json!({})), Err("command `contoso.once` is already running".into()));
+        assert!(app.unregister_command("contoso.once"));
+        assert!(!app.has_host_command("contoso.once"));
+        Ok(json!(1))
+    }))
+    .unwrap();
+    assert_eq!(app.run("contoso.once", json!({})), Ok(json!(1)));
+    assert!(!app.has_host_command("contoso.once"), "it stays unregistered");
+    assert!(app.run("contoso.once", json!({})).is_err());
 }
 
 #[test]
