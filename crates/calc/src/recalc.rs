@@ -1196,11 +1196,15 @@ impl Calc {
                 if let Some(r) = changed_range {
                     let mut deps = Vec::new();
                     self.graph.dependents_of_range(k.0, r, &mut deps);
-                    // Not the anchor itself while it spills (that would read its own array), but
-                    // when it no longer does: its new formula may have read the old array, which
-                    // was still laid out while it was evaluated.
-                    let spills = sheet.spill_ranges.contains_key(&k.1);
-                    spill_changes.extend(deps.into_iter().filter(|d| d != k || !spills));
+                    // Not the anchor itself (that would read its own array), unless its old array
+                    // is gone or partly freed: its new formula may have read the old values, still
+                    // laid out while it was evaluated.
+                    let freed = match (old, sheet.spill_ranges.get(&k.1)) {
+                        (Some(o), Some(n)) => !(n.contains(o.start) && n.contains(o.end)),
+                        (_, None) => true,
+                        (None, Some(_)) => false,
+                    };
+                    spill_changes.extend(deps.into_iter().filter(|d| d != k || freed));
                 }
                 if let Some(o) = old
                     && !sheet.spill_ranges.get(&k.1).is_some_and(|n| n.contains(o.start) && n.contains(o.end))

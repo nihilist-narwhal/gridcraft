@@ -1276,6 +1276,10 @@ fn an_anchor_given_a_formula_that_reads_its_old_spill_area_sees_it_empty() {
     assert_eq!(t.num("A3"), 3.0);
     t.set("A1", "=SUM(A2:A3)+1");
     assert_eq!((t.num("A1"), t.get("A3")), (1.0, Value::Empty));
+    // Still an array, now spilling elsewhere: it read A2 as 2 and spilled three columns.
+    t.set("A1", "=SEQUENCE(3)");
+    t.set("A1", "=SEQUENCE(1,A2+1)");
+    assert_eq!((t.num("A1"), t.get("B1"), t.get("A2")), (1.0, Value::Empty, Value::Empty));
 }
 
 #[test]
