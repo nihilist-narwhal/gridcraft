@@ -11,6 +11,8 @@ use gridcraft_formula::{BinOp, Expr, RefKind, Reference, SheetSel, StructItem, S
 use gridcraft_functions::{Arg, Ctx};
 use gridcraft_model::Workbook;
 
+use crate::host::{HostArg, HostFunctionRegistry};
+
 /// Largest array a reference may expand to.
 pub const MAX_CELLS: u64 = 16_000_000;
 /// References up to this many cells are read at their full size; larger ones (`A:A`, ranges
@@ -76,6 +78,14 @@ pub trait Host {
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
     }
+    /// The functions the embedding application provides ([`crate::host`]); none by default.
+    fn host_functions(&self) -> Option<Arc<HostFunctionRegistry>> {
+        None
+    }
+    /// Called when a formula calls a function that isn't available: one that is unknown (no
+    /// built-in, host function or LAMBDA name by that name), or a host function whose data is
+    /// still pending.
+    fn note_unavailable(&mut self) {}
 }
 
 pub struct Evaluator<'h> {
@@ -800,10 +810,15 @@ impl<'h> Evaluator<'h> {
 
     fn builtin(&mut self, name: &str, args: &[Expr]) -> Ev {
         let Some(spec) = gridcraft_functions::lookup(name) else {
+            // A function of the embedding application (`CONTOSO.LOOKUP`).
+            if let Some(ev) = self.host_function(name, args) {
+                return ev;
+            }
             // A defined name holding a LAMBDA, or a LET-bound lambda.
             if let Ev::L(l) = self.name(name) {
                 return self.apply_lambda(&l, args);
             }
+            self.host.note_unavailable();
             return err(CellError::Name);
         };
         if args.len() < spec.min_args || args.len() > spec.max_args {
@@ -855,6 +870,28 @@ impl<'h> Evaluator<'h> {
         }
         let mut ctx = FnCtx { ev: self, criteria };
         gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V)
+    }
+
+    /// Calls the host function `name` resolves to (`None`: it resolves to none). Arguments are
+    /// evaluated left to right and read: references give their values (see [`HostArg`]).
+    fn host_function(&mut self, name: &str, args: &[Expr]) -> Option<Ev> {
+        let registry = self.host.host_functions()?;
+        let f = registry.lookup(name)?;
+        if f.info.volatile {
+            self.host.note_volatile();
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for a in args {
+            values.push(match a {
+                Expr::Missing => HostArg::Omitted,
+                e => HostArg::Value(self.value(e)),
+            });
+        }
+        let v = f.call(&values);
+        if v == Value::Error(CellError::GettingData) {
+            self.host.note_unavailable();
+        }
+        Some(Ev::V(v))
     }
 
     /// Performs aggregation operations without copying its ranges: blocks are folded over the stored
@@ -1734,8 +1771,30 @@ pub fn resized_sum_range(sum: RangeRef, height: u32, width: u32) -> RangeRef {
 /// Collects the static references of an expression with their sheets resolved; `dynamic` is
 /// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change.
 pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
+    let a = analyze(wb, sheet, e, None);
+    (a.areas, a.dynamic)
+}
+
+/// What the dependency graph needs to know about a formula.
+#[derive(Debug, Default)]
+pub(crate) struct Analysis {
+    /// Static precedents, sheets resolved.
+    pub areas: Vec<Area>,
+    /// Calculated on every recalculation: the formula uses volatile functions, references only
+    /// known while evaluating (INDIRECT, OFFSET, names, tables), or functions that aren't built
+    /// in, unless they resolve to a non-volatile host function.
+    pub dynamic: bool,
+    /// The namespaces of the namespaced functions it calls that aren't built in (`CONTOSO` for
+    /// `CONTOSO.LOOKUP`), upper case, sorted, whether a host is registered for them or not.
+    pub namespaces: Vec<String>,
+}
+
+/// [`precedents`], plus the namespaces of host functions, with `hosts` deciding which calls of
+/// functions that aren't built in are host functions (and so need no recalculation every time).
+pub(crate) fn analyze(wb: &Workbook, sheet: usize, e: &Expr, hosts: Option<&HostFunctionRegistry>) -> Analysis {
     let mut out = Vec::new();
     let mut dynamic = false;
+    let mut namespaces: Vec<String> = Vec::new();
     let push = |out: &mut Vec<Area>, r: &Reference, range: RangeRef| match &r.sheet {
         SheetSel::Current => out.push(Area { sheet, range }),
         SheetSel::Named(n) => {
@@ -1769,7 +1828,16 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
             dynamic = true
         }
         Expr::Name(_) | Expr::Struct(_) => dynamic = true,
-        Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => dynamic = true,
+        Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => {
+            if let Some((ns, _)) = crate::host::split_host_name(n) {
+                namespaces.push(ns.to_ascii_uppercase());
+            }
+            // A non-volatile host function depends on its arguments only; anything else not
+            // built in (unknown, or a defined name holding a LAMBDA) may read anything.
+            if !hosts.and_then(|h| h.lookup(n)).is_some_and(|f| !f.info.volatile) {
+                dynamic = true;
+            }
+        }
         // A range ending in a function's result (`A1:INDEX(B1:B9,n)`) covers the cells between
         // the references inside it, not only those references.
         Expr::Binary(BinOp::Range, a, b) if !matches!((&**a, &**b), (Expr::Ref(_), Expr::Ref(_))) => {
@@ -1786,7 +1854,9 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         }
         _ => {}
     });
-    (out, dynamic)
+    namespaces.sort_unstable();
+    namespaces.dedup();
+    Analysis { areas: out, dynamic, namespaces }
 }
 
 fn is_special(n: &str) -> bool {

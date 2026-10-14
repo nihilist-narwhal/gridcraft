@@ -31,7 +31,9 @@ struct RowState {
     next_row: u32,
     shared: HashMap<u32, Shared>,
     /// Dynamic-array spill ranges and legacy array ranges: cached values inside them (other than
-    /// the anchor) are not stored, so the formula can fill them again.
+    /// the anchor) are not stored as cells, so the formula can fill them again. They are kept as
+    /// the formula's spilled values (`Sheet::spill`), which recalculation lays out again, and
+    /// which a formula whose functions aren't available keeps showing until recalculated.
     dynamic: Vec<RangeRef>,
     dropped: u64,
     rows: u64,
@@ -451,7 +453,20 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
     }
     let dynamic = c.attr("cm").is_some();
     let formula = c.child("f").and_then(|f| read_formula(cx, st, f, pos, dynamic));
-    let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
+    if formula.is_some()
+        && let Some(r) = st.dynamic.last().filter(|r| r.start == pos)
+    {
+        sheet.spill_ranges.insert(pos, *r);
+    }
+    let value = match st.dynamic.iter().rev().find(|r| r.contains(pos) && r.start != pos) {
+        Some(r) if formula.is_none() => {
+            if !value.is_empty() && sheet.spill_ranges.get(&r.start) == Some(r) {
+                sheet.spill.insert(pos, value);
+            }
+            Value::Empty
+        }
+        _ => value,
+    };
     sheet.cells.set(pos, Cell { value, formula: formula.map(Arc::new), style });
 }
 
