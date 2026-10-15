@@ -35,10 +35,14 @@ Errors come back as `{"id": …, "ok": false, "error": "…"}`.
 | `ui.backstage` (via `engine.execute`) | `{page?: home\|new\|open\|info\|saveAs\|print\|export\|options\|close}` | Open the File tab's Backstage view on a page, or close it (`ui.inspect` reports the open page as `backstage`) |
 | `ui.screenshot` | `{path?}` | PNG of the window (base64 when no path). Animations are settled first: the picture shows the final state |
 | `ui.set` | `{dark?, formulaBar?, ribbonCollapsed?, animations?}` | UI preferences (`formulaBar` runs `view.formulaBar`) |
-| `ui.resize` / `ui.focus` | `{width, height}` | Window control |
-| `app.open` / `app.save` / `app.quit` | `{path, password?}` / `{path?}` | Files and lifetime. `password` opens a password-protected workbook; without it, such a workbook returns an error (never a dialog) |
+| `ui.resize` / `ui.focus` | `{width, height}` | Window control (refused when the sheet is embedded without window control) |
+| `app.open` / `app.save` / `app.quit` | `{path, password?}` / `{path?}` | Files and lifetime. `password` opens a password-protected workbook; without it, such a workbook returns an error (never a dialog). `app.quit` is refused when the sheet is embedded without window control |
 
 Any other method name that is a command id (e.g. `home.bold`) runs that command.
+
+When the sheet is embedded in another application ([`embedding.md`](embedding.md)), the
+commands that application registers run like built-in ones through `engine.execute` (or by
+name), and `engine.commands` lists them with `"host": true` and their ribbon path.
 
 Use `engine.execute` with `{command: "view.theme", params: {mode: "system"}}`
 to choose the display theme; `mode` accepts `"system"`, `"light"`, or `"dark"`.

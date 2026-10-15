@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** minor (host functions: worksheet functions an embedding application provides; previously minor: two spill recalculation fixes) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** minor (embedding: the sheet as a panel of another egui application, with worksheet functions the host provides; previously minor: two spill recalculation fixes) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -15,7 +15,7 @@ This page is the summary. The detail is in:
 - Area checklists: [functions](docs/function-parity.md) · [charts](docs/chart-parity.md) ·
   [file formats](docs/file-format-parity.md) · [UI](docs/ui-parity.md) ·
   [hardware](docs/hardware-parity.md) · [localization](docs/localization-parity.md)
-- [`docs/architecture.md`](docs/architecture.md): how it is built
+- [`docs/architecture.md`](docs/architecture.md): how it is built; [`docs/embedding.md`](docs/embedding.md): the UI inside another application
 
 ## Headline numbers
 
@@ -132,6 +132,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-14 | Embedding: the sheet runs as one panel of another egui application, without the window chrome, with the host's colours, keyboard rules, ribbon tabs and commands, and workbooks the host stores as bytes ([docs/embedding.md](docs/embedding.md)) |
 | 2026-10-14 | Host functions: an application embedding GridCraft registers worksheet functions under its own namespace (`=CONTOSO.LOOKUP(A1)`): values or spilling arrays, pending data shown as `#GETTING_DATA` until the host reports it ready (only those formulas and their dependents recalculate), hostile results contained, listed by `formulas.functions`; XLSX keeps the calls with their cached values, and without the host they show those values until recalculated |
 | 2026-10-14 | Recalculation: an anchor given a formula that reads its old spill area sees it empty, and formulas that read an array which loses a spill conflict in the same recalculation show `#SPILL!` (found by command-sequence fuzzing) |
 | 2026-10-12 | Rows auto-fit oversized fonts: opening a file and whole-row/column formatting grow non-custom rows to their tallest font (#833) |

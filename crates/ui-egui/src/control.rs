@@ -15,6 +15,10 @@
 //! - `ui.screenshot {path?}` — PNG of the window (base64 when no path); animations are settled
 //! - `ui.resize {width, height}`, `ui.set {dark?, formulaBar?, ribbonCollapsed?, animations?}`
 //! - `app.open {path, password?}`, `app.save {path?}`, `app.quit`
+//!
+//! Commands an embedding application registers (`SheetApp::register_command`) run through
+//! `engine.execute` and are listed by `engine.commands` with `"host": true`. When the sheet is
+//! embedded without window controls, `ui.resize`, `ui.focus` and `app.quit` report an error.
 
 use std::sync::mpsc::Sender;
 
@@ -201,6 +205,8 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
             ] {
                 v.push(json!({"id": id, "label": label, "params": params, "enabled": true, "ui": true}));
             }
+            // The embedding application's own commands (`SheetApp::register_command`).
+            v.extend(app.host_command_list());
             ok(Json::Array(filter_commands(v, s("search"))))
         }
         "engine.journal" => ok(json!(app.session.journal.iter().map(|(id, p)| json!({"command": id, "params": p})).collect::<Vec<_>>())),
@@ -351,6 +357,8 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
             push_drag(app, pa, pb, 8, modifiers(p));
             ok(Json::Null)
         }
+        // Embedded, the window belongs to the host application.
+        "ui.resize" | "ui.focus" | "app.quit" if !app.embed.window_controls => err("the host application owns the window"),
         "ui.resize" => {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(f("width").max(400.0), f("height").max(300.0))));
             ok(Json::Null)
@@ -381,7 +389,7 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
             ok(Json::Null)
         }
         // Anything else that names a command runs it.
-        other if gridcraft_engine::find_command(other).is_some() => wrap(app.run(other, p.clone())),
+        other if gridcraft_engine::find_command(other).is_some() || app.has_host_command(other) => wrap(app.run(other, p.clone())),
         other => err(format!("unknown method `{other}`")),
     };
     ctx.request_repaint();

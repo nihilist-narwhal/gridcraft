@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (host functions: worksheet functions an embedding application provides under its own namespace) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (embedding the UI in other egui applications; host functions: worksheet functions an embedding application provides under its own namespace) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -22,7 +22,7 @@ including tests, 2026-10-10.
 | L2 | `pdf` | ~1k | Small PDF 1.7 writer (14 standard fonts, vectors, images) for print and export |
 | L3 | `chart` | ~2.9k | Toolkit-free chart layout to drawing primitives, a rasterizer, sparklines |
 | L5 | `engine` | ~17.7k | `Session`: open workbooks, selection, history (COW snapshots), clipboard, fill, sort, filter, PivotTables, what-if, print, file I/O (`io.rs`), and the command registry (`cmd/*`, 313 commands) with the Excel ribbon catalog (`catalog.rs`) |
-| L6 | `ui-egui` | ~11.6k | Excel-style UI (title bar, QAT, ribbon, formula bar, virtualised grid, editor, tabs, status bar, dialogs, task panes, chart view) and the control channel |
+| L6 | `ui-egui` | ~11.6k | Excel-style UI (title bar, QAT, ribbon, formula bar, virtualised grid, editor, tabs, status bar, dialogs, task panes, chart view), the control channel, and the embedding API (host chrome, keyboard, theme, ribbon tabs, commands) |
 | L6 | `mcp` | ~1.4k | MCP server over stdio (hand-written JSON-RPC), headless or bridged to a running app |
 | L7 | `apps/gridcraft`, `apps/gridcraft-cli`, `apps/gridcraft-web` | ~2.2k | Desktop (eframe/wgpu), CLI (`info`, `convert`, `eval`, `cat`, `run`, `commands`, `functions`, `mcp`, `send`), web (WASM via trunk) |
 | — | `xtask` | — | `ci`, `parity`, `assets`, `layers`, `wasm`, `version`, `stats` |
@@ -103,6 +103,15 @@ called like add-in functions: `=CONTOSO.LOOKUP(A1,"price")`.
 - MCP: `gridcraft-cli mcp`, headless or `--connect` to a running app, see [`mcp.md`](mcp.md).
 - CLI: [`cli.md`](cli.md).
 
+## Embedding
+
+`SheetApp::ui` draws into any egui region, so another egui application can show the sheet as one
+of its panels. `EmbedOptions` hands the window chrome (title bar, File view, status bar, window
+control), the global style (light/dark, zoom, visuals) and the keyboard outside the sheet to the
+host; the host can add its colours (`HostTheme`), ribbon tabs (`RibbonTab`), commands
+(`HostCommand`, run through `SheetApp::run` like built-in ones) and store workbooks as bytes. See
+[`embedding.md`](embedding.md).
+
 ## Platforms and builds
 
 macOS universal, Windows x64/x86/arm64, Linux x86_64/aarch64/riscv64 (AppImage, Flatpak, deb,
@@ -122,4 +131,5 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 |---|---|---|
 | 2026-10-14 | trivial | Host functions: refreshes also recalculate the formulas calculated every time (as edits do); a host panicking while declaring its functions is refused; the typed session calls keep the last-resort panic guard; `_xll.` written back in lower case |
 | 2026-10-14 | minor | Host functions: the `HostFunctions` API, resolution, recalculation and pending data, hostile results, file convention and cached values on open |
+| 2026-10-14 | minor | Embedding: the UI as a panel of another egui application (embedding.md) |
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |

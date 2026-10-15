@@ -3,6 +3,10 @@
 //!
 //! The UI is thin: it reads engine state and acts through [`SheetApp::run`] (engine commands by
 //! id). Everything it can do is also reachable over the control channel ([`control`]).
+//!
+//! The same window can be one panel in another egui application: see [`embed`] (window chrome,
+//! keyboard, host commands and workbook bytes), [`host_ribbon`] (host ribbon tabs) and
+//! [`theme::HostTheme`] (host colours).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -14,10 +18,12 @@ pub mod control;
 pub mod credits;
 pub mod dialogs;
 pub mod editor;
+pub mod embed;
 pub mod fonts;
 pub mod formula_bar;
 mod formula_locale;
 pub mod grid;
+pub mod host_ribbon;
 pub mod i18n;
 pub mod icons;
 pub mod keymap;
@@ -196,6 +202,18 @@ pub struct Services {
     /// Web: hand PDF bytes to the browser's print flow directly (no download,
     /// no intermediate file) — opens the system print dialog on that PDF.
     pub print: Option<Box<dyn Fn(&[u8])>>,
+    /// Embedding: keep a keyboard event for the host. Asked for every key, text, copy, cut and
+    /// paste event while the sheet has the keyboard; `true` hides the event, and the text its key
+    /// types, from the sheet (host widgets drawn after [`SheetApp::ui`] still get them). See also
+    /// [`embed::EmbedOptions::reserved_shortcuts`].
+    pub keep_key: Option<Box<dyn FnMut(&egui::Event) -> bool>>,
+    /// Embedding: adjust the font set GridCraft installs, e.g. put the host's typeface first in
+    /// the `ui` family ([`theme::UI`]). A family the sheet draws with that the adjustment drops
+    /// (or leaves naming a face without data) is put back as GridCraft built it.
+    pub fonts: Option<Box<dyn Fn(&mut egui::FontDefinitions)>>,
+    /// Embedding: the host stores workbooks itself. Save on a workbook without a file, and Save
+    /// As, hand it the .xlsx bytes instead of asking for a path; `Ok` marks the workbook saved.
+    pub save_workbook: Option<Box<dyn FnMut(&embed::HostSave) -> Result<(), String>>>,
 }
 
 /// Shared queue of files read asynchronously (browser file picker, drag and drop).
@@ -263,6 +281,10 @@ pub struct SheetApp {
     /// holding other text. Once the cut has been pasted, Paste leaves this text alone.
     cut_text: Option<String>,
     pub started: f64,
+    /// How the sheet sits in its window: the standalone app's chrome by default ([`embed`]).
+    pub embed: embed::EmbedOptions,
+    /// What an embedding application added: commands, ribbon tabs, colours, keyboard focus.
+    pub(crate) host: embed::Host,
 }
 
 impl SheetApp {
@@ -306,6 +328,8 @@ impl SheetApp {
             clipboard_text_at_copy: None,
             cut_text: None,
             started: now_ms(),
+            embed: embed::EmbedOptions::default(),
+            host: embed::Host::default(),
         }
     }
 
@@ -378,6 +402,12 @@ impl SheetApp {
             self.commit_text_box_edit()?;
         }
         if let Some(r) = self.run_ui_command(id, &params) {
+            return r;
+        }
+        if let Some(r) = self.host_save(id, &params) {
+            return r;
+        }
+        if let Some(r) = self.run_host_command(id, &params) {
             return r;
         }
         let r = self.session.run(id, params);
@@ -494,7 +524,7 @@ impl SheetApp {
     pub fn run_or_alert(&mut self, id: &str, params: Json) {
         // A menu/shortcut opens the settings first; the Print page's button submits explicitly.
         if id == "file.print" {
-            if self.services.print_native.is_some() {
+            if self.services.print_native.is_some() && self.embed.backstage {
                 self.open_backstage(backstage::Page::Print);
                 return;
             }
@@ -583,6 +613,10 @@ impl SheetApp {
                 self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
                 Ok(Json::Null)
             }
+            "view.darkMode" | "view.theme" | "view.interfaceScale" if !self.embed.global_style => {
+                Err("the host application sets light or dark mode and the interface size".into())
+            }
+            "ui.backstage" if !self.embed.backstage => Err("the File view is not available here".into()),
             "view.darkMode" => {
                 let current = if self.ui.system_theme { self.effective_dark } else { self.ui.dark };
                 self.ui.dark = p.get("on").and_then(Json::as_bool).unwrap_or(!current);
@@ -752,6 +786,11 @@ impl SheetApp {
     /// Opens the File tab's Backstage view on `page`, committing a cell still being edited first
     /// (File actions work on the whole workbook). A draft that can't be committed keeps the sheet.
     pub fn open_backstage(&mut self, page: backstage::Page) {
+        if !self.embed.backstage {
+            // Embedded without it (File › Options, a keytip): say so instead of doing nothing.
+            self.toast = Some(("The File view is not available here".into(), now_ms()));
+            return;
+        }
         if !self.commit_edit(0, 0, false, false) {
             return;
         }
@@ -993,67 +1032,40 @@ impl SheetApp {
         // A keytip control request lives one frame: the ribbon consumes it during `ui`, and
         // anything that never reached a control (collapsed ribbon, tab switch) is dropped.
         self.ui.keytip_invoke = None;
-        if self.fonts_han.is_some_and(|han| han != theme::HanOrder::of(self.ui.language)) {
-            self.fonts_ready = false;
-            self.fonts_set = false;
-        }
-        if !self.fonts_ready {
-            // New fonts apply from the next frame on: paint nothing until then.
-            if self.fonts_set {
-                self.fonts_ready = true;
-            } else {
-                SheetApp::setup_context_for_language(ctx, self.ui.dark, self.ui.language);
-                self.fonts_set = true;
-                // The rebuilt set has no workbook fonts yet: bind them again once it is active.
-                self.fonts_bound.clear();
-                self.fonts_seen = (0, 0);
-                self.fonts_han = Some(theme::HanOrder::of(self.ui.language));
+        // The host's colours are in the context before anything (the host's panels too) draws.
+        self.sync_host_theme(ctx);
+        // Embedded without the global style, fonts and colours are handled in `ui` (inside the
+        // frame, where the host's font set can be read), and light/dark and zoom are the host's.
+        if self.embed.global_style {
+            self.manage_fonts(ctx);
+            if let Some(answer) = self.desktop_theme.take_change() {
+                self.desktop_dark = Some(answer);
+            }
+            let preference = match (
+                self.ui.system_theme,
+                ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
+            ) {
+                (true, Some(egui::Theme::Dark)) => egui::ThemePreference::Dark,
+                (true, Some(egui::Theme::Light)) => egui::ThemePreference::Light,
+                _ => self.ui.theme_preference(),
+            };
+            if ctx.options(|o| o.theme_preference) != preference {
+                ctx.set_theme(preference);
                 ctx.request_repaint();
             }
-        } else if self.fonts_rebind {
-            // A font-set change made last frame is active now.
-            self.fonts_rebind = false;
-        } else if fonts::scan_done() {
-            // Bind the workbook's installed fonts once the background scan has finished. Adding
-            // fonts re-applies the font set, which egui activates at the next pass, so skip this
-            // frame's paint (same one-frame cost as startup). Only when the workbook changed.
-            let seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
-            if seen != self.fonts_seen {
-                let used = self.used_fonts();
-                self.fonts_seen = seen;
-                if used != self.fonts_bound {
-                    ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used));
-                    self.fonts_bound = used;
-                    self.fonts_rebind = true;
-                    ctx.request_repaint();
-                }
-            }
-        }
-        if let Some(answer) = self.desktop_theme.take_change() {
-            self.desktop_dark = Some(answer);
-        }
-        let preference = match (
-            self.ui.system_theme,
-            ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
-        ) {
-            (true, Some(egui::Theme::Dark)) => egui::ThemePreference::Dark,
-            (true, Some(egui::Theme::Light)) => egui::ThemePreference::Light,
-            _ => self.ui.theme_preference(),
-        };
-        if ctx.options(|o| o.theme_preference) != preference {
-            ctx.set_theme(preference);
-            ctx.request_repaint();
         }
         self.effective_dark = ctx.theme() == egui::Theme::Dark;
-        // Interface size: the preference owns the zoom factor, so egui's own Ctrl/Cmd +/-/0 zoom
-        // keys stay off (they would also swallow GridCraft's shortcuts).
-        if ctx.options(|o| o.zoom_with_keyboard) {
-            ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        }
-        let zoom = self.ui.zoom_factor();
-        if (ctx.zoom_factor() - zoom).abs() > 0.001 {
-            ctx.set_zoom_factor(zoom);
-            ctx.request_repaint();
+        if self.embed.global_style {
+            // Interface size: the preference owns the zoom factor, so egui's own Ctrl/Cmd +/-/0
+            // zoom keys stay off (they would also swallow GridCraft's shortcuts).
+            if ctx.options(|o| o.zoom_with_keyboard) {
+                ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            }
+            let zoom = self.ui.zoom_factor();
+            if (ctx.zoom_factor() - zoom).abs() > 0.001 {
+                ctx.set_zoom_factor(zoom);
+                ctx.request_repaint();
+            }
         }
         control::poll(self, ctx);
         // Files read asynchronously (web file picker, dropped files).
@@ -1084,14 +1096,108 @@ impl SheetApp {
         }
     }
 
+    /// Installs the fonts, and rebinds them when the language's Han order or the workbook's fonts
+    /// change. New fonts apply from the next frame on, so `ui` paints nothing until then.
+    fn manage_fonts(&mut self, ctx: &egui::Context) {
+        if self.fonts_han.is_some_and(|han| han != theme::HanOrder::of(self.ui.language)) {
+            self.fonts_ready = false;
+            self.fonts_set = false;
+        }
+        // The set installed last frame (or earlier) is the active one now, unless something else
+        // replaced it since: an embedding application's own `set_fonts`, before or after the sheet
+        // drew. Install GridCraft's families again before anything draws with them (egui panics
+        // on a family it doesn't know). Embedded, the workbook fonts' families are checked too.
+        if self.fonts_set && !theme::families_installed(ctx, !self.embed.global_style) {
+            self.fonts_ready = false;
+            self.fonts_set = false;
+            self.fonts_rebind = false;
+        }
+        if !self.fonts_ready {
+            // New fonts apply from the next frame on: paint nothing until then.
+            if self.fonts_set {
+                self.fonts_ready = true;
+            } else {
+                self.install_fonts(ctx, &[]);
+                if self.embed.global_style {
+                    theme::apply(ctx, self.ui.dark);
+                }
+                self.fonts_set = true;
+                // The rebuilt set has no workbook fonts yet: bind them again once it is active.
+                self.fonts_bound.clear();
+                self.fonts_seen = (0, 0);
+                self.fonts_han = Some(theme::HanOrder::of(self.ui.language));
+                ctx.request_repaint();
+            }
+        } else if self.fonts_rebind {
+            // A font-set change made last frame is active now.
+            self.fonts_rebind = false;
+        } else if fonts::scan_done() {
+            // Bind the workbook's installed fonts once the background scan has finished. Adding
+            // fonts re-applies the font set, which egui activates at the next pass, so skip this
+            // frame's paint (same one-frame cost as startup). Only when the workbook changed.
+            let seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
+            if seen != self.fonts_seen {
+                let used = self.used_fonts();
+                self.fonts_seen = seen;
+                if used != self.fonts_bound {
+                    self.install_fonts(ctx, &used);
+                    self.fonts_bound = used;
+                    self.fonts_rebind = true;
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    /// Hands GridCraft's font set (with the workbook fonts in `used`) to egui: merged into the
+    /// host's when embedded without the global style, adjusted by the host's `fonts` service.
+    fn install_fonts(&self, ctx: &egui::Context, used: &[String]) {
+        let ours = theme::font_definitions_with(self.ui.language, used);
+        // The host's adjustment may not take away a family the sheet draws with.
+        let keep = self.services.fonts.is_some().then(|| ours.clone());
+        let mut fonts = if self.embed.global_style { ours } else { theme::merge_font_definitions(ctx.fonts(|f| f.definitions().clone()), ours) };
+        if let (Some(adjust), Some(ours)) = (&self.services.fonts, &keep) {
+            adjust(&mut fonts);
+            theme::restore_families(&mut fonts, ours);
+        }
+        ctx.set_fonts(fonts);
+    }
+
     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
         if let Some(mut batch) = self.synthetic.pop_front() {
+            // Keys an agent sends over the control channel are meant for the sheet.
+            if !self.has_keyboard() && batch.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))) {
+                self.focus_keyboard();
+            }
             raw.events.append(&mut batch);
         }
     }
 
-    /// Lays out the whole window.
+    /// Lays out the whole window, or (embedded) the sheet's panel: call it with the `Ui` of the
+    /// region the sheet fills, after [`Self::logic`].
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if !self.embed.global_style {
+            self.sync_host_theme(&ctx);
+            self.manage_fonts(&ctx);
+        }
+        self.track_keyboard(ui);
+        let had_keyboard = self.has_keyboard();
+        let withheld = self.withhold_keys(&ctx);
+        if self.embed.global_style {
+            self.draw(ui);
+        } else {
+            // GridCraft's look for its own region only: the host's style stays as it was.
+            let style = theme::sheet_style(ui.style(), &theme::Tokens::get(&ctx));
+            ui.scope(|ui| {
+                ui.set_style(style);
+                self.draw(ui);
+            });
+        }
+        self.finish_keys(&ctx, withheld, had_keyboard);
+    }
+
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_printing(&ctx);
         if !self.fonts_ready || self.fonts_rebind {
@@ -1106,7 +1212,9 @@ impl SheetApp {
         if self.backstage.is_none() {
             self.ribbon_keys(&ctx);
         }
-        ribbon::title_bar(self, ui);
+        if self.embed.title_bar {
+            ribbon::title_bar(self, ui);
+        }
         if self.backstage.is_some() {
             // File tab: the Backstage view replaces everything below the title bar.
             backstage::show(self, ui);
@@ -1116,7 +1224,7 @@ impl SheetApp {
             if self.session.prefs.formula_bar {
                 formula_bar::show(self, ui);
             }
-            if self.ui.status_bar {
+            if self.ui.status_bar && self.embed.status_bar {
                 tabs::status_bar(self, ui);
             }
             tabs::sheet_tabs(self, ui);
@@ -1133,9 +1241,6 @@ impl SheetApp {
         widgets::toast(self, &ctx);
         control::issue_screenshots(self, &ctx);
         control::collect_screenshots(self, &ctx);
-        if !ctx.input(|i| i.focused) {
-            // Nothing else to do.
-        }
         let now = now_ms();
         self.perf.frame_ms = now - t0;
         if self.perf.last > 0.0 {
@@ -1156,8 +1261,10 @@ impl SheetApp {
             self.store_view_state();
             let _ = self.session.run("file.save", json!({}));
         }
-        // Window title.
-        if let Some(d) = self.session.active() {
+        // Window title (the host titles its own window when the sheet is embedded).
+        if self.embed.window_controls
+            && let Some(d) = self.session.active()
+        {
             let title = format!("{}{}", d.display_title(), if d.is_dirty() { " — Edited" } else { "" });
             if self.grid.last_title.as_deref() != Some(title.as_str()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1168,7 +1275,8 @@ impl SheetApp {
 
     fn ribbon_keys(&mut self, ctx: &egui::Context) {
         let before = self.keytips.prefix().map(str::to_string);
-        let enabled = self.editor.is_none()
+        let enabled = self.has_keyboard()
+            && self.editor.is_none()
             && self.dialog.is_none()
             && self.message.is_none()
             && self.name_box.is_none()
@@ -1179,7 +1287,8 @@ impl SheetApp {
             && self.grid.list_picker.is_none()
             && self.grid.renaming_tab.is_none()
             && (before.is_some() || !egui::Popup::is_any_open(ctx));
-        let actions = self.keytips.process(ctx, enabled);
+        let host = self.host_keytips();
+        let actions = self.keytips.process_with_host(ctx, enabled, &host);
         if before.is_some() && before.as_deref() != self.keytips.prefix() && !ctx.input(|i| i.pointer.any_pressed()) {
             // Leave pointer cancellation to the popup so clicking a menu item still works.
             egui::Popup::close_all(ctx);
@@ -1205,6 +1314,8 @@ impl SheetApp {
                 // runs its click handler with the right params (the engine command alone would
                 // be missing them).
                 keytips::Action::Control(id) => self.ui.keytip_invoke = Some(id),
+                keytips::Action::HostTab(index) => self.select_host_tab(index),
+                keytips::Action::HostButton(tab, group, button) => self.press_host_button(tab, group, button),
             }
         }
     }

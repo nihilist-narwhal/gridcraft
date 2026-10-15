@@ -18,6 +18,19 @@ pub enum Action {
     /// handler (which carries the right params), instead of firing the engine command with
     /// empty params.
     Control(&'static str),
+    /// Switch to the embedding application's ribbon tab at this index (see `RibbonTab::keytip`).
+    HostTab(usize),
+    /// Press the button (tab, group, button) on an embedding application's ribbon tab.
+    HostButton(usize, usize, usize),
+}
+
+/// What a keytip sequence an embedding application added does: the host's ribbon tabs and their
+/// buttons, matched after the built-in table (they can't clash with it, see
+/// [`keytip_table::conflicts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostEntry {
+    Tab(usize),
+    Button(usize, usize, usize),
 }
 
 #[derive(Default)]
@@ -39,6 +52,12 @@ impl KeyTips {
         self.held.clear();
     }
 
+    /// Another key went down while Alt was held (one the sheet never sees, e.g. a shortcut the
+    /// embedding application keeps): releasing Alt is not a keytip tap.
+    pub(crate) fn interrupt(&mut self) {
+        self.alt_armed = false;
+    }
+
     fn toggle(&mut self) {
         self.prefix = if self.prefix.is_some() { None } else { Some(String::new()) };
         self.alt_armed = false;
@@ -46,6 +65,13 @@ impl KeyTips {
 
     /// Remove only handled events before any text editors or the grid see them.
     pub fn process(&mut self, ctx: &Context, enabled: bool) -> Vec<Action> {
+        self.process_with_host(ctx, enabled, &[])
+    }
+
+    /// [`Self::process`] with the sequences an embedding application added (its ribbon tabs).
+    pub fn process_with_host(&mut self, ctx: &Context, enabled: bool, host: &[(String, HostEntry)]) -> Vec<Action> {
+        let host_lookup = |seq: &str| host.iter().find(|(s, _)| s == seq).map(|(_, entry)| *entry);
+        let deeper = |prefix: &str| keytip_table::has_deeper(prefix) || host.iter().any(|(s, _)| s.len() > prefix.len() && s.starts_with(prefix));
         if !enabled || !ctx.input(|i| i.focused) {
             self.clear();
             return Vec::new();
@@ -112,17 +138,26 @@ impl KeyTips {
                                     // A tab with deeper sequences stays as an active level
                                     // (its group badges show); a terminal unit like "JI"
                                     // finishes and clears the prefix.
-                                    self.prefix = keytip_table::has_deeper(&next).then_some(next);
+                                    self.prefix = deeper(&next).then_some(next);
                                     actions.push(Action::Tab(tab));
                                 }
                                 Some(keytip_table::Entry::Continue) => self.prefix = Some(next),
                                 Some(keytip_table::Entry::Finish(action)) => self.finish(action, &mut actions),
-                                // No complete sequence, but deeper ones start here: wait for
-                                // more input (Excel's two-letter units like Draw's "JI").
-                                None if keytip_table::has_deeper(&next) => self.prefix = Some(next),
-                                // Unknown letters are consumed while a prefix is active but
-                                // leave it unchanged, as Excel does.
-                                None => {}
+                                None => match host_lookup(&next) {
+                                    // A host tab works like a built-in one: its buttons' badges
+                                    // show while its letters are the prefix.
+                                    Some(HostEntry::Tab(index)) => {
+                                        self.prefix = deeper(&next).then_some(next);
+                                        actions.push(Action::HostTab(index));
+                                    }
+                                    Some(HostEntry::Button(tab, group, button)) => self.finish(Action::HostButton(tab, group, button), &mut actions),
+                                    // No complete sequence, but deeper ones start here: wait for
+                                    // more input (Excel's two-letter units like Draw's "JI").
+                                    None if deeper(&next) => self.prefix = Some(next),
+                                    // Unknown letters are consumed while a prefix is active but
+                                    // leave it unchanged, as Excel does.
+                                    None => {}
+                                },
                             }
                         }
                     }
@@ -209,6 +244,35 @@ mod tests {
             assert_eq!(tips.prefix(), None);
             assert_eq!(remaining, events);
         }
+    }
+
+    fn press(ctx: &Context, tips: &mut KeyTips, host: &[(String, HostEntry)], keys: &[Key]) -> Vec<Action> {
+        let events = keys.iter().flat_map(|k| [key(*k, true, Modifiers::NONE), key(*k, false, Modifiers::NONE)]).collect();
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput { events, focused: true, ..Default::default() }, |ui| {
+            actions = tips.process_with_host(ui.ctx(), true, host);
+        });
+        output.textures_delta.clear();
+        actions
+    }
+
+    #[test]
+    fn host_sequences_switch_tabs_and_press_buttons() {
+        let ctx = Context::default();
+        let host = vec![("Y".to_string(), HostEntry::Tab(0)), ("YR".to_string(), HostEntry::Button(0, 0, 1)), ("JX".to_string(), HostEntry::Tab(1))];
+        let mut tips = KeyTips::default();
+        assert!(press(&ctx, &mut tips, &host, &[Key::F10]).is_empty());
+        assert_eq!(press(&ctx, &mut tips, &host, &[Key::Y]), vec![Action::HostTab(0)]);
+        assert_eq!(tips.prefix(), Some("Y"), "the host tab's button badges show");
+        assert_eq!(press(&ctx, &mut tips, &host, &[Key::R]), vec![Action::HostButton(0, 0, 1)]);
+        assert_eq!(tips.prefix(), None);
+        // A host tab under a built-in implicit level ("J" waits for Draw's "JI").
+        press(&ctx, &mut tips, &host, &[Key::F10]);
+        assert_eq!(press(&ctx, &mut tips, &host, &[Key::J, Key::X]), vec![Action::HostTab(1)]);
+        assert_eq!(tips.prefix(), None, "a host tab without buttons finishes the sequence");
+        // Built-in sequences are unaffected by host entries.
+        press(&ctx, &mut tips, &host, &[Key::F10]);
+        assert_eq!(press(&ctx, &mut tips, &host, &[Key::H]), vec![Action::Tab("Home")]);
     }
 
     #[test]
