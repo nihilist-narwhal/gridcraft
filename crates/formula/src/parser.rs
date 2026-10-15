@@ -18,19 +18,32 @@ pub struct ParseError {
 pub(crate) const MAX_DEPTH: usize = 256;
 
 /// Longest formula that can be entered, in characters (the leading `=` excluded): Excel's limit
-/// for formula contents, checked by [`check_entered_length`] where a formula is typed. Text read
-/// from a file or given to the API is not held to it: a formula's file form is longer than what
-/// was typed (`_xlfn.LET`, `_xlpm.x` for each use of a LET or LAMBDA name, `_xlfn.ANCHORARRAY(A1)`
-/// for `A1#`), so a formula entered near the limit can be twice as long or more on disk.
+/// for formula contents, checked by [`check_entered_length`] where a formula is typed or set
+/// through the command API. Text that [`parse`] reads from files (and gets from its other
+/// callers) is not held to it: a formula's file form is longer than what was typed (`_xlfn.LET`,
+/// `_xlpm.x` for each use of a LET or LAMBDA name, `_xlfn.ANCHORARRAY(A1)` for `A1#`,
+/// `_xlfn.SINGLE(x)` for `@x`), so a formula entered near the limit can take several times as
+/// many characters on disk. Such text is held to [`MAX_FORMULA_BYTES`] instead.
 ///
-/// What any formula text is held to instead is its operators. The parser applies operators in a
-/// loop, one tree level each (`1+1+…` nests a level per `+`), and dropping, cloning and walking
-/// the tree recurse through those levels. Each operator is counted at the fewest characters it
-/// takes when typed (see `Parser::operators`) and a formula whose operators alone would not fit
-/// in `MAX_FORMULA_LEN` characters is refused. With the nesting limit this keeps the tree of any
-/// formula text, however long, no deeper than one that can be typed, and never refuses a formula
-/// that can be: its file form has the same operators.
+/// Any formula text is also held to its operators. The parser applies operators in a loop, one
+/// tree level each (`1+1+…` nests a level per `+`), and dropping, cloning and walking the tree
+/// recurse through those levels. Each operator is counted at the fewest characters it takes when
+/// typed (see `Parser::operators`) and a formula whose operators alone would not fit in
+/// `MAX_FORMULA_LEN` characters is refused. With the nesting limit this keeps the tree of any
+/// formula text about as deep as one that can be typed at most (parentheses, calls and prefix
+/// operators are held to the nesting limit, not counted), and never refuses a formula that can
+/// be typed: its file form has the same operators.
 pub const MAX_FORMULA_LEN: usize = 8_192;
+
+/// Longest formula text [`parse`] accepts, in bytes (the leading `=` excluded): 256 KiB. It is
+/// checked before tokenizing, which takes about 160 bytes of memory per character, so formula
+/// text from a small, highly compressed file can't make each parse of it allocate gigabytes.
+///
+/// The file form of any formula that can be entered stays well under it. The longest rewrite is
+/// `@`, saved as `_xlfn.SINGLE(…)`: 14 bytes for each `@` typed, so a formula of 8,192 `@`
+/// and other characters takes at most about 112 KiB on disk (an entered character that is not
+/// rewritten takes at most 4 bytes).
+pub const MAX_FORMULA_BYTES: usize = 256 * 1024;
 
 /// Refuses formula text longer than can be entered ([`MAX_FORMULA_LEN`] characters, the leading
 /// `=` excluded), as Excel does when a formula is typed or set.
@@ -43,14 +56,18 @@ pub fn check_entered_length(src: &str) -> Result<(), ParseError> {
 }
 
 /// Parses formula text. A leading `=` (or `+`/`-` as Lotus users type) is accepted and skipped
-/// for `=`. The text may be longer than [`MAX_FORMULA_LEN`] (files, API); nesting and the number
-/// of operators are limited instead.
+/// for `=`. The text may be longer than [`MAX_FORMULA_LEN`], as a formula's file form is, up to
+/// [`MAX_FORMULA_BYTES`]; its nesting and the number of its operators are limited too.
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
     parse_syntax(src, crate::FormulaLocale::En)
 }
 
 pub(crate) fn parse_syntax(src: &str, locale: crate::FormulaLocale) -> Result<Expr, ParseError> {
     let body = src.strip_prefix('=').unwrap_or(src);
+    // Before tokenizing, whose memory grows with the text: the operator count comes after it.
+    if body.len() > MAX_FORMULA_BYTES {
+        return Err(ParseError { msg: format!("formula is longer than {MAX_FORMULA_BYTES} bytes"), pos: 0 });
+    }
     let toks = tokenize_locale(body, locale).map_err(|e| ParseError { msg: e.msg, pos: e.pos })?;
     let toks = significant_spaces(toks);
     let mut p = Parser { toks, i: 0, depth: 0, operators: 0, input: locale == crate::FormulaLocale::Es };

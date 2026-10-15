@@ -1098,7 +1098,8 @@ fn let_formula_longer_than_the_limit_in_its_file_form_calculates_after_reopening
     assert_eq!(v(&s, "B1"), Value::Number(6000.0));
 }
 
-/// Entering a formula longer than 8,192 characters is refused, as in Excel.
+/// Entering a formula longer than 8,192 characters is refused, as in Excel, in a cell or as a
+/// name's formula.
 #[test]
 fn entering_a_formula_longer_than_the_limit_is_refused() {
     let mut s = s();
@@ -1109,6 +1110,11 @@ fn entering_a_formula_longer_than_the_limit_is_refused() {
     let err = s.execute("cell.set", json!({"cell": "A2", "input": format!("{at_limit}1")})).unwrap_err().to_string();
     assert!(err.contains("8192"), "{err}");
     assert!(v(&s, "A2").is_empty());
+    s.execute("formulas.defineName", json!({"name": "AtLimit", "refersTo": at_limit})).unwrap();
+    let err = s.execute("formulas.defineName", json!({"name": "TooLong", "refersTo": format!("{at_limit}1")})).unwrap_err().to_string();
+    assert!(err.contains("8192"), "{err}");
+    let names = s.doc().unwrap().wb.names.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names, ["AtLimit"]);
 }
 
 /// Fixture for the open-time row fit (issue #833): `row_info` = (size, custom, hidden) for

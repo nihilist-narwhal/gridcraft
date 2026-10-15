@@ -230,8 +230,11 @@ fn hyperlinks_past_the_cell_cap_are_reported() {
 
 /// Formula text built to overflow a recursive parser or tree walk (a million `%`, a 200,000-term
 /// sum, 31,000 `%` through nested parentheses): the cells keep their formula text and cached
-/// value, nothing overflows the stack. File text has no length limit; its nesting and operators
-/// are what is limited.
+/// value, and opening, saving and dropping the workbook fit in a 1 MiB stack. File text isn't
+/// held to the 8,192 characters a formula can be entered with, but to `MAX_FORMULA_BYTES`, the
+/// nesting limit and its operators. (A formula just within the operator limit, such as 4,096
+/// additions, can still overflow a stack this small; making the tree walks iterative is the
+/// follow-up in #1307.)
 #[test]
 fn hostile_formula_text_does_not_overflow_the_stack() {
     let percents = format!("1{}", "%".repeat(1_000_000));
