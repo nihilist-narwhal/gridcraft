@@ -85,6 +85,7 @@ refresh. Counted under features (Get & Transform, ~10% ready), not here.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | trivial | Add-in calls read as `_xll.NAME(…)` are written back with the lower-case prefix files use (the parser upper-cases function names) |
 | 2026-10-14 | minor | User-defined functions (`_xludf.`/`_xll.` names and namespaced names that aren't Excel's, such as host functions): formulas keep the plain name and are written as dynamic-array formulas (`cm`, `t="array"`), so Excel neither adds `@` nor keeps one value of an array; cached spilled values of dynamic and legacy arrays are read back as the anchor's spill, so a formula whose function isn't available shows them until recalculated |
 | 2026-10-14 | trivial | Formula parser: text longer than Excel's 8,192 characters, and postfix chains (`1%%%…`, `f(1)(1)…`) past the 256-level nesting limit, are parse errors (the cell keeps its formula text and cached value) instead of trees deep enough to overflow the stack when a hostile file is opened, saved or dropped |
 | 2026-10-12 | trivial | XLSX chart sheets are kept on save (#727) |

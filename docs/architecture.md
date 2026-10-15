@@ -69,21 +69,27 @@ called like add-in functions: `=CONTOSO.LOOKUP(A1,"price")`.
 - **Recalculation.** A non-volatile host function depends on the cells its arguments read only,
   so editing other cells never calls the host; a volatile one is calculated every time. The
   graph indexes formulas by the namespaces they call, so registering or removing a host, or
-  `host_data_ready`, recalculates just those formulas and their dependents (in manual
-  calculation, those formulas only). Undo and redo ask the host again for the restored
-  workbook's host formulas, whose results may be from while the data was pending.
+  `host_data_ready`, recalculates just those formulas and their dependents, plus, as after any
+  edit, the formulas calculated every time (volatile functions, INDIRECT/OFFSET, names, unknown
+  functions); in manual calculation, the namespace's formulas only. Undo and redo ask the host
+  again for the restored workbook's host formulas, whose results may be from while the data was
+  pending.
 - **Pending data.** Calls are synchronous and must return promptly; slow work returns `Pending`,
   shown as `#GETTING_DATA`, until the host reports its data ready. Nothing waits or polls, so it
   works the same on wasm. A host that never reports stays `#GETTING_DATA`.
 - **Hostile results.** NaN and infinities are `#NUM!`; text over 32,767 characters, arrays whose
   shape doesn't match their data and the internal `#CIRC!` are `#VALUE!`; arrays over
   10,000,000 cells are `#NUM!`; arrays nested in arrays are `#CALC!` and are dropped without
-  recursion however deep they nest; a host that panics gives `#VALUE!` (native builds; on wasm a
-  panic aborts).
+  recursion however deep they nest; a host that panics gives `#VALUE!`, and one that panics
+  while giving its namespace or catalog is refused (native builds; on wasm a panic aborts). The
+  typed session calls keep the last-resort guard of `Session::execute`: a panic escaping the
+  recalculation they run leaves the workbook as it was.
 - **Files.** Formulas keep the host function's plain name (`CONTOSO.LOOKUP(…)`), as files store
   user-defined functions, and are written as dynamic-array formulas (`cm`, `t="array"`) since
   only the host knows whether it returns an array; Excel otherwise shows `=@CONTOSO.LOOKUP(…)`.
   The last values are cached, spilled ones included, so other applications show the numbers.
+  The `_xludf.` and `_xll.` prefixes of calls read from a file are written back as files spell
+  them.
   The reader keeps cached spilled values as the anchor's spill. Opening calculates every
   formula except those that call something unavailable, an unknown function (no host
   registered) or a host function whose data is pending: they keep the file's values (spills
@@ -114,5 +120,6 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | trivial | Host functions: refreshes also recalculate the formulas calculated every time (as edits do); a host panicking while declaring its functions is refused; the typed session calls keep the last-resort panic guard; `_xll.` written back in lower case |
 | 2026-10-14 | minor | Host functions: the `HostFunctions` API, resolution, recalculation and pending data, hostile results, file convention and cached values on open |
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |

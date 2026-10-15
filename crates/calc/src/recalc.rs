@@ -922,10 +922,11 @@ impl Calc {
     }
 
     /// Recalculates the formulas that call functions of `namespace` (ignoring case; registered or
-    /// not), or of every registered namespace, and their dependents (in manual calculation, those
-    /// formulas only): a host reporting new data, a host registered or removed, a workbook
-    /// restored by undo whose host results may be out of date (pending then). Returns the number
-    /// of formulas calculated.
+    /// not), or of every registered namespace, and their dependents, with the formulas
+    /// calculated every time as after any edit (in manual calculation, the namespace's formulas
+    /// only): a host reporting new data, a host registered or removed, a workbook restored by
+    /// undo whose host results may be out of date (pending then). Nothing is calculated when no
+    /// formula calls the namespace. Returns the number of formulas calculated.
     pub fn recalc_host_calls(&mut self, wb: &mut Workbook, namespace: Option<&str>) -> usize {
         let seeds = match namespace {
             Some(ns) => self.graph.host_callers(Some(ns)),

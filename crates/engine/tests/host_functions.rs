@@ -180,6 +180,28 @@ fn a_panicking_host_gives_an_error_value_not_a_failed_command() {
 }
 
 #[test]
+fn a_host_that_panics_while_registering_is_refused() {
+    struct Broken;
+    impl HostFunctions for Broken {
+        fn namespace(&self) -> &str {
+            "FABRIKAM"
+        }
+        fn catalog(&self) -> Vec<HostFunctionInfo> {
+            panic!("catalog unavailable")
+        }
+        fn call(&self, _: &str, _: &[HostArg]) -> HostResult {
+            HostResult::Pending
+        }
+    }
+    let (mut s, _) = session();
+    set(&mut s, "A1", "=FABRIKAM.X()");
+    let err = s.register_host_functions(Arc::new(Broken)).unwrap_err();
+    assert!(err.to_string().contains("panicked"), "{err}");
+    assert_eq!(s.host_functions().namespaces().collect::<Vec<_>>(), ["CONTOSO"]);
+    assert_eq!(value(&s, "A1"), Value::Error(CellError::Name));
+}
+
+#[test]
 fn the_function_list_and_evaluate_know_host_functions() {
     let (mut s, _) = session();
     let list = s.execute("formulas.functions", json!({"category": "UserDefined"})).unwrap();
@@ -487,6 +509,196 @@ fn command_sequences_with_late_host_data_stay_consistent() {
         }
         if let Some(diff) = values_differ(&wb, &reopened, true) {
             panic!("seed {seed}: reopened values differ: {diff}\n{}", log.join("\n"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- hostile hosts
+
+/// A host that misbehaves at random: numbers that aren't finite, malformed, empty, oversized,
+/// off-the-sheet or deeply nested arrays, text longer than a cell holds, internal error values,
+/// data that never arrives, panics, and a different answer to the same question each time (it
+/// is declared non-volatile all the same).
+struct Chaos {
+    state: std::sync::atomic::AtomicU64,
+    /// An array the host keeps a handle on while the engine reads it.
+    kept: Value,
+}
+
+impl Chaos {
+    fn new(seed: u64) -> Chaos {
+        let kept =
+            Value::from(Array::column((0..50).map(|i| if i % 7 == 0 { Value::Number(f64::NAN) } else { Value::Number(f64::from(i)) }).collect()));
+        Chaos { state: std::sync::atomic::AtomicU64::new(seed), kept }
+    }
+    fn roll(&self) -> u64 {
+        let mut r = Rng(self.state.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::SeqCst));
+        r.next()
+    }
+}
+
+impl HostFunctions for Chaos {
+    fn namespace(&self) -> &str {
+        "FABRIKAM"
+    }
+    fn catalog(&self) -> Vec<HostFunctionInfo> {
+        vec![
+            HostFunctionInfo::new("ANY", "Anything at all.").optional_arg("x", "").optional_arg("y", ""),
+            HostFunctionInfo::new("TICK", "Anything, volatile.").volatile(),
+        ]
+    }
+    fn call(&self, _name: &str, args: &[HostArg]) -> HostResult {
+        let roll = self.roll();
+        let n = (roll >> 8) as usize % 40 + 1;
+        match roll % 24 {
+            0 => f64::NAN.into(),
+            1 => f64::NEG_INFINITY.into(),
+            2 | 3 => HostResult::Pending,
+            4 => panic!("host bug"),
+            5 => HostResult::Array(Array { rows: 3, cols: 3, data: vec![Value::Number(1.0)] }),
+            6 => HostResult::Array(Array { rows: 0, cols: n, data: vec![] }),
+            7 => HostResult::Array(Array { rows: usize::MAX, cols: 3, data: vec![] }),
+            8 => HostResult::Array(Array { rows: 1, cols: 20_000, data: vec![Value::Number(1.0); 20_000] }),
+            9 => {
+                let mut v = Value::Number(1.0);
+                for _ in 0..5_000 {
+                    v = Value::from(Array::scalar(v));
+                }
+                HostResult::Array(Array::row(vec![v, Value::Bool(true)]))
+            }
+            10 => HostResult::Value(Value::text("x".repeat(40_000))),
+            11 => HostResult::Error(CellError::Circ),
+            12 => HostResult::Error(CellError::Spill),
+            13 => HostResult::Value(self.kept.clone()),
+            14 => HostResult::Array(Array {
+                rows: 2,
+                cols: 2,
+                data: vec![
+                    Value::Number(f64::INFINITY),
+                    Value::from(Array::scalar(Value::Empty)),
+                    Value::text("y".repeat(33_000)),
+                    Value::Bool(false),
+                ],
+            }),
+            15 | 16 => HostResult::Array(Array::column((0..n).map(|i| Value::Number(i as f64)).collect())),
+            17 => HostResult::Array(Array { rows: n, cols: 3, data: vec![Value::text("z"); n * 3] }),
+            18 => args.first().and_then(HostArg::value).cloned().map_or(HostResult::Value(Value::Empty), HostResult::Value),
+            19 => HostResult::Value(Value::Empty),
+            _ => ((roll % 1000) as f64).into(),
+        }
+    }
+}
+
+/// Every stored value is one the rest of the engine can rely on.
+fn sound(wb: &Workbook) -> Option<String> {
+    let bad = |v: &Value| match v {
+        Value::Array(_) => true,
+        Value::Number(n) => !n.is_finite(),
+        Value::Text(t) => t.chars().count() > 32_767,
+        _ => false,
+    };
+    for sh in &wb.sheets {
+        for (c, cell) in sh.cells.iter() {
+            if bad(&cell.value) {
+                return Some(format!("{}!{c} holds {:?}", sh.name, cell.value));
+            }
+        }
+        for (c, v) in &sh.spill {
+            if bad(v) {
+                return Some(format!("{}!{c} spills {v:?}", sh.name));
+            }
+        }
+        for (a, r) in &sh.spill_ranges {
+            if r.start != *a
+                || r.end.row >= gridcraft_core::MAX_ROWS
+                || r.end.col >= gridcraft_core::MAX_COLS
+                || sh.cell(*a).is_none_or(|c| c.formula.is_none())
+            {
+                return Some(format!("{}!{a} spills over {}", sh.name, r.a1()));
+            }
+        }
+    }
+    None
+}
+
+fn hostile_input(rng: &mut Rng) -> String {
+    let c = cell(rng);
+    match rng.below(14) {
+        0 | 1 => "=FABRIKAM.ANY()".into(),
+        2 => format!("=FABRIKAM.ANY({c})"),
+        3 => format!("=FABRIKAM.ANY({c}:E8,{c})"),
+        4 => "=FABRIKAM.TICK()".into(),
+        5 => format!("=SUM({c}#)+FABRIKAM.ANY()"),
+        6 => format!("=IFERROR(FABRIKAM.ANY({c}),-1)"),
+        7 => format!("=FABRIKAM.ANY(FABRIKAM.ANY({c}))*2"),
+        8 => format!("=INDEX(FABRIKAM.ANY(),{})", 1 + rng.below(3)),
+        9 => format!("={c}+1"),
+        10 => format!("=SUM({c}:E8)"),
+        11 => String::new(),
+        _ => format!("{}", rng.below(100)),
+    }
+}
+
+/// Random edits, refreshes, undo, structural edits, saves and reopens, and the host registered
+/// and removed, against a host that misbehaves in every way it can: no command fails because of
+/// it, nothing panics, every stored value stays sound, and every state saves and reopens.
+#[test]
+fn hostile_hosts_never_break_the_session() {
+    let seeds: u64 = std::env::var("GRIDCRAFT_FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let steps: usize = std::env::var("GRIDCRAFT_FUZZ_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let only: Option<u64> = std::env::var("GRIDCRAFT_FUZZ_SEED").ok().and_then(|v| v.parse().ok());
+    for seed in only.map_or(0..seeds, |s| s..s + 1) {
+        let mut rng = Rng(seed ^ 0xBAD_C0DE);
+        let host = Arc::new(Chaos::new(seed));
+        let mut s = Session::new();
+        s.register_host_functions(host.clone()).unwrap();
+        s.new_workbook();
+        let mut log = Vec::new();
+        for i in 0..steps {
+            let (id, params) = match rng.below(16) {
+                0..=6 => ("cell.set".to_string(), json!({"cell": cell(&mut rng), "input": hostile_input(&mut rng)})),
+                7 => ("formulas.refreshHostFunctions".into(), json!({})),
+                8 => ("edit.undo".into(), json!({})),
+                9 => ("edit.redo".into(), json!({})),
+                10 => ("home.insertRows".into(), json!({"rows": format!("{0}:{0}", 1 + rng.below(6))})),
+                11 => ("home.deleteColumns".into(), json!({"cols": "B:B"})),
+                12 => ("formulas.calculateNow".into(), json!({})),
+                13 => ("data.sortAscending".into(), json!({"range": "A1:E8", "column": "A"})),
+                14 => ("<reopen>".into(), json!({})),
+                _ => ("<toggle host>".into(), json!({})),
+            };
+            log.push(format!("{id} {params}"));
+            match id.as_str() {
+                "<reopen>" => {
+                    let file = save(&mut s);
+                    open(&mut s, &file);
+                }
+                "<toggle host>" => {
+                    if !s.unregister_host_functions("FABRIKAM") {
+                        s.register_host_functions(host.clone()).unwrap();
+                    }
+                }
+                _ => match s.execute(&id, params) {
+                    Err(EngineError::Internal(_, msg)) => panic!("seed {seed}, step {i}: `{id}` panicked: {msg}\n{}", log.join("\n")),
+                    Err(e) if id == "formulas.refreshHostFunctions" || id == "cell.set" => {
+                        panic!("seed {seed}, step {i}: `{id}` failed: {e}\n{}", log.join("\n"))
+                    }
+                    _ => {}
+                },
+            }
+            s.take_ui_requests();
+            let wb = s.doc().unwrap().wb.clone();
+            if let Some(problem) = sound(&wb) {
+                panic!("seed {seed}, step {i}: {problem}\n{}", log.join("\n"));
+            }
+            // A full recalculation (whose values may differ: the host answers at random) survives too.
+            let mut fresh = (*wb).clone();
+            let mut calc = Calc::new();
+            calc.set_host_functions(s.host_functions().clone());
+            calc.recalc_all(&mut fresh);
+            if let Some(problem) = sound(&fresh) {
+                panic!("seed {seed}, step {i}: after a full recalculation, {problem}\n{}", log.join("\n"));
+            }
         }
     }
 }

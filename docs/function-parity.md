@@ -112,10 +112,10 @@ workbooks; results checked in as data, not Excel files) and fixing what it finds
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Host functions: an embedding application's namespaced functions (`UserDefined` in `formulas.functions`), not counted against Excel's list |
 | 2026-10-12 | minor | USDOLLAR added as a Compatibility function (not on Microsoft's list, so the counts don't change); MIRR with no positive flow is -1, COUNTIF's bare `"<="` / `">="` skip empty strings, INDIRECT with `a1` = FALSE gives `#REF!` for A1-style text (#738) |
 | 2026-10-11 | minor | TEXT / number formats fixed against Excel-cached results: fraction literals and zero fractions, `0` denominators zero padded, `?` pads the thousands separator, booleans use the text section (226 mismatches → 0 in 352 TEXT cells) |
 | 2026-10-11 | minor | Iterative calculation: circular references iterate up to Maximum Iterations / Maximum Change when enabled |
-| 2026-10-14 | minor | Host functions: an embedding application's namespaced functions (`UserDefined` in `formulas.functions`), not counted against Excel's list |
 | 2026-10-11 | minor | Trim-reference operators (`:.`, `.:`, `.:.`) and unbracketed `[[#This Row],Col]` done; dropped the stale "Scope of what's missing" rows for TRIMRANGE, PERCENTOF, BAHTTEXT and the trim references |
 | 2026-10-11 | minor | Fixes from the cached-value oracle (`gridcraft-cli check`): MODE / MODE.SNGL / MODE.MULT give `#VALUE!` for text in a direct argument or single-cell reference; `VALUE("")` is `#VALUE!`; SUMPRODUCT with a text scalar argument is `#VALUE!`; ADDRESS leaves `[Book]Sheet` unquoted; VLOOKUP / HLOOKUP / LOOKUP / MATCH approximate match bisect like Excel on unsorted mixed-type data; XLOOKUP / XMATCH binary search compares across types in sort order; SUBTOTAL leaves out filtered rows for every function number (table and sheet AutoFilters) |
 | 2026-10-11 | minor | ODDFPRICE, ODDFYIELD, ODDLPRICE, ODDLYIELD added: Financial 55 / 55; 505 / 523 by name, 496 working |

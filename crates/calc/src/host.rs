@@ -182,6 +182,8 @@ pub enum HostFunctionError {
     Duplicate(String),
     /// The catalog declares more than [`MAX_HOST_FUNCTIONS`] functions.
     TooMany(usize),
+    /// The host panicked while giving its namespace or catalog.
+    Panicked,
 }
 
 impl fmt::Display for HostFunctionError {
@@ -196,6 +198,7 @@ impl fmt::Display for HostFunctionError {
             HostFunctionError::Builtin(n) => write!(f, "`{n}` is a built-in function"),
             HostFunctionError::Duplicate(n) => write!(f, "function `{n}` is declared twice"),
             HostFunctionError::TooMany(n) => write!(f, "{n} functions declared (at most {MAX_HOST_FUNCTIONS})"),
+            HostFunctionError::Panicked => write!(f, "the host panicked while declaring its functions"),
         }
     }
 }
@@ -270,12 +273,14 @@ impl HostFunctionRegistry {
     /// Registers `host` under its namespace, replacing a host registered for the same namespace
     /// (which also re-reads a changed catalog). Returns the namespace, upper case.
     pub fn register(&mut self, host: Arc<dyn HostFunctions>) -> Result<String, HostFunctionError> {
-        let namespace = host.namespace().to_string();
+        // The host's own code: a panic in it refuses the host rather than unwinding through
+        // the engine (on wasm, where panics abort, this is only as good as the host).
+        let declared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (host.namespace().to_string(), host.catalog())));
+        let Ok((namespace, catalog)) = declared else { return Err(HostFunctionError::Panicked) };
         if !valid_namespace(&namespace) {
             return Err(HostFunctionError::InvalidNamespace(namespace));
         }
         let namespace = namespace.to_ascii_uppercase();
-        let catalog = host.catalog();
         if catalog.len() > MAX_HOST_FUNCTIONS {
             return Err(HostFunctionError::TooMany(catalog.len()));
         }
@@ -395,8 +400,12 @@ pub fn sanitize(r: HostResult) -> Value {
         HostResult::Error(e) => error(e),
         HostResult::Value(Value::Array(a)) => match Arc::try_unwrap(a) {
             Ok(a) => array(a),
-            // Shared with the host: copy what is kept.
-            Err(a) => array(Array { rows: a.rows, cols: a.cols, data: a.data.clone() }),
+            // Shared with the host: check the shape before copying what is kept, so a malformed
+            // or oversized array is never copied.
+            Err(a) => match shape_error(a.rows, a.cols, a.data.len()) {
+                Some(e) => Value::Error(e),
+                None => array(Array { rows: a.rows, cols: a.cols, data: a.data.clone() }),
+            },
         },
         HostResult::Value(v) => scalar(v),
         HostResult::Array(a) => array(a),
@@ -420,19 +429,23 @@ fn scalar(v: Value) -> Value {
     }
 }
 
+/// Why an array of `rows` × `cols` holding `len` values can't be kept: `#VALUE!` when the shape
+/// overflows, is empty or doesn't match the data, `#NUM!` when it is larger than
+/// [`MAX_HOST_ARRAY_CELLS`].
+fn shape_error(rows: usize, cols: usize, len: usize) -> Option<CellError> {
+    match rows.checked_mul(cols) {
+        None => Some(CellError::Value),
+        Some(cells) if cells > MAX_HOST_ARRAY_CELLS => Some(CellError::Num),
+        Some(cells) if cells == 0 || cells != len => Some(CellError::Value),
+        Some(_) => None,
+    }
+}
+
 fn array(a: Array) -> Value {
     let Array { rows, cols, data } = a;
-    let Some(cells) = rows.checked_mul(cols) else {
+    if let Some(e) = shape_error(rows, cols, data.len()) {
         drop_all(data);
-        return Value::Error(CellError::Value);
-    };
-    if cells > MAX_HOST_ARRAY_CELLS {
-        drop_all(data);
-        return Value::Error(CellError::Num);
-    }
-    if cells == 0 || cells != data.len() {
-        drop_all(data);
-        return Value::Error(CellError::Value);
+        return Value::Error(e);
     }
     let data: Vec<Value> = data.into_iter().map(scalar).collect();
     Array::new(rows, cols, data).map(Value::from).unwrap_or(Value::Error(CellError::Value))
@@ -554,6 +567,33 @@ mod tests {
         assert_eq!(sanitize(HostResult::Value(nested.clone())), Value::from(Array::scalar(Value::Number(1.0))));
         let kept = nested.clone();
         assert_eq!(sanitize(HostResult::Value(nested)), kept);
+        // A malformed or oversized array the host keeps a handle on is refused, not copied.
+        let shared = |rows, cols, data: Vec<Value>| Value::Array(Arc::new(Array { rows, cols, data }));
+        let held = shared(MAX_HOST_ARRAY_CELLS + 1, 1, vec![Value::Number(1.0)]);
+        assert_eq!(sanitize(HostResult::Value(held.clone())), e(CellError::Num));
+        let held = shared(2, 2, vec![Value::Number(1.0)]);
+        assert_eq!(sanitize(HostResult::Value(held.clone())), e(CellError::Value));
+    }
+
+    #[test]
+    fn a_host_that_panics_while_declaring_its_functions_is_refused() {
+        struct Broken(bool);
+        impl HostFunctions for Broken {
+            fn namespace(&self) -> &str {
+                if self.0 { panic!("no namespace") } else { "CONTOSO" }
+            }
+            fn catalog(&self) -> Vec<HostFunctionInfo> {
+                panic!("no catalog")
+            }
+            fn call(&self, _: &str, _: &[HostArg]) -> HostResult {
+                HostResult::Pending
+            }
+        }
+        let mut reg = HostFunctionRegistry::new();
+        for namespace_panics in [true, false] {
+            assert_eq!(reg.register(Arc::new(Broken(namespace_panics))), Err(HostFunctionError::Panicked));
+        }
+        assert!(reg.is_empty());
     }
 
     #[test]

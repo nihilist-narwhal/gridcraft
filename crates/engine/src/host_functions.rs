@@ -73,7 +73,9 @@ impl Session {
     /// The application's data for `namespace` is ready: runs `formulas.refreshHostFunctions`,
     /// which calculates the formulas calling its functions again, with their dependents, in every
     /// open workbook (formulas whose result was pending now get it). Returns how many formulas
-    /// were calculated.
+    /// were calculated. Each report calls every function of the namespace that formulas use
+    /// again, so a host whose data arrives in many small pieces reports once per batch (for
+    /// example once per frame of the application's event loop), not once per piece.
     pub fn host_data_ready(&mut self, namespace: &str) -> Result<usize> {
         let r = self.execute("formulas.refreshHostFunctions", json!({"namespace": namespace}))?;
         Ok(usize::try_from(r["cells"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX))
@@ -90,7 +92,19 @@ impl Session {
 /// Gives a document the session's host functions and calculates the formulas calling functions
 /// of `namespace` (`None`: of every namespace registered before or now). The graph is rebuilt:
 /// whether a call is a non-volatile host function decides what it depends on.
+///
+/// The typed calls that get here don't run through [`Session::execute`], so this keeps its
+/// last-resort guard: a panic escaping the recalculation leaves the workbook as it was.
 pub(crate) fn install(d: &mut DocState, hosts: &Arc<HostFunctionRegistry>, namespace: Option<&str>) {
+    let before = d.wb.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install_unguarded(d, hosts, namespace))).is_err() {
+        d.wb = before;
+        d.calc.set_host_functions(Arc::clone(hosts));
+        d.calc.rebuild(&d.wb);
+    }
+}
+
+fn install_unguarded(d: &mut DocState, hosts: &Arc<HostFunctionRegistry>, namespace: Option<&str>) {
     let gone: Vec<String> = d.calc.host_functions().namespaces().filter(|ns| !hosts.has_namespace(ns)).map(str::to_string).collect();
     d.calc.set_host_functions(Arc::clone(hosts));
     d.calc.rebuild(&d.wb);

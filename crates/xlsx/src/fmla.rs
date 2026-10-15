@@ -74,7 +74,7 @@ fn expr_to_file(e: Expr) -> String {
     let e = e.map(&mut |x| match x {
         Expr::Call(name, args) => match crate::tables::file_function_name(&name) {
             Some(n) => Expr::Call(n, args),
-            None => Expr::Call(name, args),
+            None => Expr::Call(add_in_prefix(name), args),
         },
         // Files have no `#` operator: Excel writes `A1#` as `_xlfn.ANCHORARRAY(A1)`, and a spill
         // reference that became `#REF!` (its cell was deleted) as plain `#REF!`.
@@ -95,6 +95,17 @@ fn expr_to_file(e: Expr) -> String {
         other => other,
     });
     gridcraft_formula::print(&e)
+}
+
+const ADD_IN_PREFIX: &str = "_xll.";
+
+/// Files spell the prefix of add-in functions in lower case, like `_xludf.`; the parser
+/// upper-cases function names, so `_xll.MYFN` reads as `_XLL.MYFN` and is written back as it came.
+fn add_in_prefix(name: String) -> String {
+    match (name.get(..ADD_IN_PREFIX.len()), name.get(ADD_IN_PREFIX.len()..)) {
+        (Some(p), Some(rest)) if p.eq_ignore_ascii_case(ADD_IN_PREFIX) && p != ADD_IN_PREFIX => format!("{ADD_IN_PREFIX}{rest}"),
+        _ => name,
+    }
 }
 
 /// `_xlpm.x` → `x` (any case, as the parser upper-cases function names).

@@ -110,3 +110,14 @@ fn cached_spills_from_other_applications_stay_with_their_anchor() {
     assert!(!sh.spill_ranges.contains_key(&at("B1")));
     assert!(!sh.spill.contains_key(&at("C5")) && sh.value(at("C6")) == Value::Empty);
 }
+
+#[test]
+fn add_in_prefixes_are_written_back_as_files_spell_them() {
+    let sheet = r#"<sheetData><row r="1"><c r="A1"><f>_xll.CONTOSO.QUOTE("X")+_xludf.MYFN(1)</f><v>3</v></c></row></sheetData>"#;
+    let (wb, _) = read_xlsx(&super::minimal(sheet, &[], "", "")).unwrap();
+    let bytes = write_xlsx(&wb).unwrap();
+    let mut pkg = Package::open(&bytes).unwrap();
+    let sheet = pkg.read_xml("xl/worksheets/sheet1.xml").unwrap().unwrap();
+    assert_eq!(cell(&sheet, "A1").child("f").unwrap().text, "_xll.CONTOSO.QUOTE(\"X\")+_xludf.MYFN(1)");
+    assert_eq!(cell(&sheet, "A1").child("v").unwrap().text, "3");
+}
