@@ -1179,10 +1179,12 @@ impl Calc {
                         if let Some(cell) = sheet.cells.get_mut(k.1) {
                             cell.value = Value::Error(CellError::Spill);
                         }
-                        // Blocked only by what was laid out since (another array of this pass):
-                        // the formulas that read the anchor's value in this pass read #SPILL! now.
+                        // Not blocked while the pass ran (it would have been #SPILL! there), so
+                        // blocked by another array of this pass: the formulas that read this one,
+                        // at its anchor or over the area it would have spilled into, read #SPILL!
+                        // or empty cells now.
                         let mut deps = Vec::new();
-                        self.graph.dependents(k.0, k.1, &mut deps);
+                        self.graph.dependents_of_range(k.0, range, &mut deps);
                         spill_changes.extend(deps.into_iter().filter(|d| d != k));
                     } else {
                         for (i, c) in range.iter().enumerate() {
