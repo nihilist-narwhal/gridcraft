@@ -133,6 +133,11 @@ impl DocState {
         let mut calc = Calc::new();
         calc.set_host_functions(hosts);
         calc.recalc_loaded(&mut wb);
+        // A workbook whose active sheet is hidden (another program wrote it, or a script activated
+        // the sheet before saving) opens on the nearest visible sheet.
+        if let Some(i) = wb.visible_sheet_from(wb.active_sheet) {
+            wb.active_sheet = i;
+        }
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
