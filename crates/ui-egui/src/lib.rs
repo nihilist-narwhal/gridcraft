@@ -732,6 +732,12 @@ impl SheetApp {
                             .unwrap_or(text)
                     });
                     self.begin_edit(text, false);
+                    // A command that opens the cell editor (Insert Function with a name, AutoSum
+                    // without a range) is there to be typed into: in a host's window the sheet
+                    // takes the keyboard, even when a host button or menu ran the command.
+                    if self.editor.is_some() && self.embed.keyboard == embed::KeyboardScope::Focus {
+                        self.focus_keyboard();
+                    }
                 }
                 UiRequest::OpenUrl(u) => {
                     if let Some(f) = &self.services.open_url {

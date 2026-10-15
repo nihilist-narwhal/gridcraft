@@ -1752,7 +1752,11 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
         r.request_focus();
     });
     let locale = app.ui.language.formula_locale();
-    let list = gridcraft_engine::cmd::formulas::function_list();
+    // The built-in functions and the embedding application's (category "UserDefined"), by name.
+    let hosts = app.session.host_functions().clone();
+    let mut list = gridcraft_engine::cmd::formulas::function_list();
+    list.extend(gridcraft_engine::cmd::formulas::host_function_list(&hosts));
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     let q = d.search.to_ascii_lowercase();
     let hits: Vec<&Json> = list
         .iter()
@@ -1781,8 +1785,10 @@ fn insert_function(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confir
     });
     if let Some(f) = hits.get(d.list_index) {
         ui.separator();
-        ui.label(egui::RichText::new(crate::formula_locale::signature(f["name"].as_str().unwrap_or(""), locale).unwrap_or_default()).strong());
-        ui.label(crate::formula_locale::description(f["name"].as_str().unwrap_or(""), locale).unwrap_or_default());
+        ui.label(
+            egui::RichText::new(crate::formula_locale::signature(f["name"].as_str().unwrap_or(""), locale, &hosts).unwrap_or_default()).strong(),
+        );
+        ui.label(crate::formula_locale::description(f["name"].as_str().unwrap_or(""), locale, &hosts).unwrap_or_default());
     }
     let mut open = true;
     ok_cancel(ui, confirm, &mut open);

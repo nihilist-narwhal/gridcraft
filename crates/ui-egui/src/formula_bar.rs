@@ -319,12 +319,7 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
             ed.completion = crate::editor::column_completion(sh, ed.cell, &ed.text);
         }
         ed.point = None;
-        let names: Vec<String> = function_names()
-            .iter()
-            .map(|name| {
-                app.session.active().map(|d| crate::formula_locale::completion_name(name, ed.locale, &d.wb, ed.sheet)).unwrap_or(name).to_string()
-            })
-            .collect();
+        let names = completion_names(app, ed.locale, ed.sheet);
         ed.update_autocomplete(&names);
         app.session.mode = if ed.can_point() {
             gridcraft_engine::Mode::Point
@@ -350,6 +345,7 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     }
     // Autocomplete list and argument hint under the editor.
     if mine && ui.is_rect_visible(resp.rect) && (!ed.autocomplete.is_empty() || ed.current_function().is_some()) {
+        let hosts = app.session.host_functions().clone();
         let below = resp.rect.left_bottom() + vec2(0.0, 4.0);
         // Areas have their own clip rect: keep cell helpers inside the worksheet.
         let bounds = if ed.from_formula_bar { ui.ctx().content_rect() } else { ui.clip_rect() };
@@ -366,11 +362,11 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
                         if r.clicked() {
                             pick = Some(i);
                         }
-                        if sel && let Some(desc) = crate::formula_locale::description(n, ed.locale) {
+                        if sel && let Some(desc) = crate::formula_locale::description(n, ed.locale, &hosts) {
                             r.on_hover_text(desc);
                         }
                     }
-                    if let Some(desc) = ed.autocomplete.get(ed.ac_index).and_then(|n| crate::formula_locale::description(n, ed.locale)) {
+                    if let Some(desc) = ed.autocomplete.get(ed.ac_index).and_then(|n| crate::formula_locale::description(n, ed.locale, &hosts)) {
                         ui.separator();
                         ui.add(egui::Label::new(egui::RichText::new(desc).small()).wrap());
                     }
@@ -380,7 +376,7 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
                         ed.request_focus = true;
                     }
                 } else if let Some((name, arg)) = ed.current_function()
-                    && let Some(sig) = crate::formula_locale::signature(&name, ed.locale)
+                    && let Some(sig) = crate::formula_locale::signature(&name, ed.locale, &hosts)
                 {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -399,11 +395,20 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
                         ui.label(egui::RichText::new(")").font(theme::ui_font(12.0)));
                     });
                     // The description too, so values an argument takes (DATEDIF's units, #363) show
-                    // while it's typed; wrapped to the hint's width.
-                    if let Some(desc) = crate::formula_locale::description(&name, ed.locale) {
+                    // while it's typed; wrapped to the hint's width. The embedding application
+                    // describes each argument of its functions: the one being typed follows.
+                    let desc = crate::formula_locale::description(&name, ed.locale, &hosts);
+                    let arg_help = crate::formula_locale::host_argument(&name, ed.locale, arg, &hosts);
+                    if desc.is_some() || arg_help.is_some() {
                         ui.set_max_width(ui.min_rect().width().max(220.0));
                         ui.separator();
+                    }
+                    if let Some(desc) = desc {
                         ui.add(egui::Label::new(egui::RichText::new(desc).small()).wrap());
+                    }
+                    if let Some((arg_name, arg_desc)) = arg_help {
+                        let dim = Tokens::get(ui.ctx()).text_dim;
+                        ui.add(egui::Label::new(egui::RichText::new(format!("{arg_name}: {arg_desc}")).small().color(dim)).wrap());
                     }
                 }
             });
@@ -452,11 +457,24 @@ fn cycle_anchor(ed: &mut crate::editor::EditState) {
     }
 }
 
-fn function_names() -> Vec<String> {
+fn function_names() -> &'static [String] {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    NAMES
-        .get_or_init(|| gridcraft_engine::cmd::formulas::function_list().iter().filter_map(|f| f["name"].as_str().map(str::to_string)).collect())
-        .clone()
+    NAMES.get_or_init(|| gridcraft_engine::cmd::formulas::function_list().iter().filter_map(|f| f["name"].as_str().map(str::to_string)).collect())
+}
+
+/// The names AutoComplete offers, sorted: the built-in functions as the locale spells them, and
+/// the functions of the embedding application (`CONTOSO.LOOKUP`), which the session's host
+/// registry lists while the host is registered.
+fn completion_names(app: &SheetApp, locale: gridcraft_engine::formula::FormulaLocale, sheet: usize) -> Vec<String> {
+    let doc = app.session.active();
+    let mut names: Vec<String> = function_names()
+        .iter()
+        .map(|name| doc.map(|d| crate::formula_locale::completion_name(name, locale, &d.wb, sheet)).unwrap_or(name).to_string())
+        .collect();
+    names.extend(app.session.host_functions().functions().map(|f| f.full_name()));
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn function_info(name: &str) -> Option<serde_json::Value> {

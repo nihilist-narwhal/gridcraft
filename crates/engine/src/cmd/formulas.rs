@@ -22,7 +22,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Function…",
             ["Formulas", "Function Library"],
             Some("Shift+F3"),
-            "{name?: \"VLOOKUP\"} (UI opens the dialog; with a name, starts the formula in the active cell)",
+            "{name?: \"VLOOKUP\"|\"CONTOSO.LOOKUP\"} (UI opens the dialog; with a name (built-in, of the embedding application, or a LAMBDA name), starts the formula in the active cell → {formula})",
             has_doc,
             insert_function
         ),
@@ -162,8 +162,21 @@ fn auto_sum(s: &mut Session, p: &Json) -> Result<Json> {
 fn insert_function(s: &mut Session, p: &Json) -> Result<Json> {
     match str_param(p, "name") {
         Some(n) => {
-            s.ui_requests.push(crate::UiRequest::EditCell(Some(format!("={}(", n.to_ascii_uppercase()))));
-            ok()
+            // Only a function a formula can call: built-in, the embedding application's
+            // (`CONTOSO.LOOKUP`), or a workbook name (a LAMBDA). A typo in a caller's params
+            // reports it instead of starting a formula that can only give #NAME?.
+            let name = n.trim().to_ascii_uppercase();
+            let sheet = s.doc()?.wb.active_sheet;
+            let known = gridcraft_calc::is_known_function(&name)
+                || function_list().iter().any(|f| f["name"].as_str() == Some(name.as_str()))
+                || s.host_functions().lookup(&name).is_some()
+                || s.doc()?.wb.name(&name, sheet).is_some();
+            if !known {
+                return Err(bad("formulas.insertFunction", format!("unknown function {:?}", n.trim())));
+            }
+            let formula = format!("={name}(");
+            s.ui_requests.push(crate::UiRequest::EditCell(Some(formula.clone())));
+            Ok(json!({"formula": formula}))
         }
         None => {
             s.ui_requests.push(crate::UiRequest::Dialog("insertFunction".into(), json!({})));

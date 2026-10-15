@@ -132,6 +132,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-14 | Host functions in the formula editor: AutoComplete offers an embedding application's functions, the argument hint shows their signature and per-argument descriptions, Insert Function lists them, and a host's ribbon button inserts one into the active cell (`formulas.insertFunction` takes host names) |
 | 2026-10-14 | Embedding: the sheet runs as one panel of another egui application, without the window chrome, with the host's colours, keyboard rules, ribbon tabs and commands, and workbooks the host stores as bytes ([docs/embedding.md](docs/embedding.md)) |
 | 2026-10-14 | Host functions: an application embedding GridCraft registers worksheet functions under its own namespace (`=CONTOSO.LOOKUP(A1)`): values or spilling arrays, pending data shown as `#GETTING_DATA` until the host reports it ready (only those formulas and their dependents recalculate), hostile results contained, listed by `formulas.functions`; XLSX keeps the calls with their cached values, and without the host they show those values until recalculated |
 | 2026-10-14 | Recalculation: an anchor given a formula that reads its old spill area sees it empty, and formulas that read an array which loses a spill conflict in the same recalculation show `#SPILL!` (found by command-sequence fuzzing) |

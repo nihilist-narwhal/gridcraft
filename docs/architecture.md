@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (embedding the UI in other egui applications; host functions: worksheet functions an embedding application provides under its own namespace) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (host functions in the formula editor: AutoComplete, argument hints, Insert Function; previously minor: embedding the UI in other egui applications, host functions) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -54,7 +54,7 @@ called like add-in functions: `=CONTOSO.LOOKUP(A1,"price")`.
   `catalog() -> Vec<HostFunctionInfo>`, `call(name, &[HostArg]) -> HostResult`) and the
   `HostFunctionRegistry`. `HostFunctionInfo { name, description, args: [HostArgInfo { name,
   description, optional }], volatile }` feeds `formulas.functions` (category `UserDefined`, with
-  `namespace`, `args` and `volatile`) for autocomplete and Insert Function. `HostArg` is
+  `namespace`, `args` and `volatile`). `HostArg` is
   `Omitted` or a value (a reference is read: one value, or an array for a block). `HostResult`
   is a value, a 2-D array (it spills like a dynamic array, `#SPILL!` when blocked), `Pending` or
   an error. The engine (L5) holds the registry on the `Session`, shared by every document:
@@ -62,6 +62,12 @@ called like add-in functions: `=CONTOSO.LOOKUP(A1,"price")`.
   can't be command parameters), `unregister_host_functions(namespace)`, `host_functions()` and
   `host_data_ready(namespace)`, which runs the command `formulas.refreshHostFunctions
   {namespace?}` (not journaled: data arriving is no user action).
+- **In the editor.** The UI reads the session's registry: formula AutoComplete offers the host's
+  functions among the built-in ones, the argument hint shows their signature and description and
+  the description of the argument being typed, and Insert Function lists them (category
+  `UserDefined`). `formulas.insertFunction {name}` takes a host function's name too, so a host's
+  ribbon button can start `=CONTOSO.LOOKUP(` in the active cell; a name no formula can call is an
+  error.
 - **Resolution.** Built-in functions first: a namespace never shadows one (`NORM.DIST` stays
   built in with a host registered for `NORM`, and a host declaring a built-in's name is refused).
   Then the host registered for the name's first segment, then a defined name holding a LAMBDA;
@@ -129,6 +135,7 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Host functions in the editor: AutoComplete, argument hints with per-argument descriptions, Insert Function; `formulas.insertFunction` takes host names and refuses unknown ones |
 | 2026-10-14 | trivial | Host functions: refreshes also recalculate the formulas calculated every time (as edits do); a host panicking while declaring its functions is refused; the typed session calls keep the last-resort panic guard; `_xll.` written back in lower case |
 | 2026-10-14 | minor | Host functions: the `HostFunctions` API, resolution, recalculation and pending data, hostile results, file convention and cached values on open |
 | 2026-10-14 | minor | Embedding: the UI as a panel of another egui application (embedding.md) |

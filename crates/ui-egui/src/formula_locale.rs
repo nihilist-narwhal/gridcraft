@@ -1,4 +1,5 @@
 //! UI formula syntax boundary. Engine commands, control/API callers and XLSX keep English.
+use gridcraft_engine::calc::HostFunctionRegistry;
 use gridcraft_engine::formula::{self, FormulaLocale, ParseError};
 use gridcraft_engine::model::Workbook;
 
@@ -101,17 +102,24 @@ const SPANISH_HELP: &[(&str, &str, &str)] = &[
     ("FALSE", "FALSO()", "Devuelve el valor lógico FALSO."),
 ];
 
-pub(crate) fn signature(name: &str, locale: FormulaLocale) -> Option<String> {
+/// The signature shown while typing a function's arguments (`VLOOKUP(lookup_value, …)`), in the
+/// locale's list separator. Built-in functions first, as formulas resolve them, then the
+/// embedding application's (`CONTOSO.LOOKUP(key, [column])`, from its catalog).
+pub(crate) fn signature(name: &str, locale: FormulaLocale, hosts: &HostFunctionRegistry) -> Option<String> {
     let canonical = locale.canonical_name(name);
     if locale == FormulaLocale::Es
         && let Some((_, signature, _)) = SPANISH_HELP.iter().find(|(name, ..)| *name == canonical)
     {
         return Some((*signature).into());
     }
-    crate::formula_bar::function_signature(canonical).map(|s| s.replace(',', &locale.list_separator().to_string()))
+    crate::formula_bar::function_signature(canonical)
+        .or_else(|| hosts.lookup(name).map(|f| f.info.signature(f.namespace)))
+        .map(|s| s.replace(',', &locale.list_separator().to_string()))
 }
 
-pub(crate) fn description(name: &str, locale: FormulaLocale) -> Option<String> {
+/// What a function does, for the AutoComplete list and the argument hint; built-in functions
+/// first, then the embedding application's.
+pub(crate) fn description(name: &str, locale: FormulaLocale, hosts: &HostFunctionRegistry) -> Option<String> {
     let canonical = locale.canonical_name(name);
     if locale == FormulaLocale::Es
         && let Some((_, _, description)) = SPANISH_HELP.iter().find(|(name, ..)| *name == canonical)
@@ -119,6 +127,19 @@ pub(crate) fn description(name: &str, locale: FormulaLocale) -> Option<String> {
         return Some((*description).into());
     }
     crate::formula_bar::function_description(canonical)
+        .or_else(|| hosts.lookup(name).map(|f| f.info.description.clone()).filter(|d| !d.trim().is_empty()))
+}
+
+/// The name and description of argument `index` (from 0) of a function of the embedding
+/// application, which its catalog describes one by one. `None` for built-in functions (their
+/// description covers the arguments), past the last argument, and for an undescribed one.
+pub(crate) fn host_argument(name: &str, locale: FormulaLocale, index: usize, hosts: &HostFunctionRegistry) -> Option<(String, String)> {
+    if crate::formula_bar::function_signature(locale.canonical_name(name)).is_some() {
+        return None;
+    }
+    let f = hosts.lookup(name)?;
+    let arg = f.info.args.get(index)?;
+    (!arg.description.trim().is_empty()).then(|| (arg.name.clone(), arg.description.clone()))
 }
 
 /// Avoid suggesting an alias that would call a workbook/table name instead of the function.

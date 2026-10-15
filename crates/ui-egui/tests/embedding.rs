@@ -7,12 +7,13 @@
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{Color32, Event, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::kittest::Queryable as _;
-use gridcraft_engine::Session;
-use gridcraft_engine::core::{CellRef, Value};
+use gridcraft_engine::core::{CellError, CellRef, Value};
+use gridcraft_engine::{HostArg, HostFunctionInfo, HostFunctions, HostResult, Session};
 use gridcraft_ui_egui::embed::{EmbedOptions, HostCommand, KeyboardScope};
 use gridcraft_ui_egui::host_ribbon::{RibbonButton, RibbonGroup, RibbonTab};
 use gridcraft_ui_egui::icons::Icon;
@@ -650,6 +651,103 @@ fn host_tab_buttons_run_commands() {
         let tabs_row = Rect::from_min_size(pos2(HOST_PANEL, 0.0), vec2(1280.0 - HOST_PANEL, 60.0));
         assert!(count(&img, tabs_row, Tokens::light().accent) > 10);
     }
+}
+
+/// Worksheet functions of the host, which its ribbon tab inserts.
+struct Contoso;
+
+impl HostFunctions for Contoso {
+    fn namespace(&self) -> &str {
+        "CONTOSO"
+    }
+    fn catalog(&self) -> Vec<HostFunctionInfo> {
+        vec![
+            HostFunctionInfo::new("LOOKUP", "Looks a key up in the host's data.")
+                .arg("key", "The key to look up.")
+                .optional_arg("column", "Which column."),
+            HostFunctionInfo::new("RATE", "The current rate of a key.").arg("key", "The currency."),
+        ]
+    }
+    fn call(&self, name: &str, args: &[HostArg]) -> HostResult {
+        let key = args.first().and_then(HostArg::value).map(Value::display).unwrap_or_default();
+        match name {
+            "LOOKUP" => format!("{key} found").as_str().into(),
+            "RATE" => (key.len() as f64).into(),
+            _ => CellError::Name.into(),
+        }
+    }
+}
+
+#[test]
+fn host_tab_buttons_insert_host_formulas_into_the_active_cell() {
+    let mut s = session();
+    s.register_host_functions(Arc::new(Contoso)).unwrap();
+    let mut app = SheetApp::embedded(s, Services::default());
+    app.add_ribbon_tab(
+        RibbonTab::new("Contoso").keytip("Y").group(
+            RibbonGroup::new("Data")
+                // Starts the formula in the active cell for the user to finish (Insert Function).
+                .button(RibbonButton::new("Lookup", "formulas.insertFunction").params(json!({"name": "CONTOSO.LOOKUP"})).keytip("L"))
+                // Writes a complete formula into the active cell.
+                .button(RibbonButton::new("Euro Rate", "cell.set").params(json!({"input": "=CONTOSO.RATE(\"EUR\")"})).small())
+                .button(RibbonButton::new("Misspelt", "formulas.insertFunction").params(json!({"name": "CONTOSO.LOKUP"})).small()),
+        ),
+    )
+    .unwrap();
+    let mut h = harness(app);
+    h.get_by_label("Contoso").click();
+    h.run_steps(3);
+    h.state_mut().app.run("selection.set", json!({"range": "B3"})).unwrap();
+    h.get_by_label("Lookup").click();
+    h.run_steps(3);
+    assert!(h.state().app.has_keyboard(), "the click was in the sheet");
+    assert_eq!(h.state().app.editor.as_ref().map(|e| e.text.as_str()), Some("=CONTOSO.LOOKUP("));
+    assert!(has_label(&h, "key: The key to look up."), "the hint describes the host's argument");
+    type_text(&mut h, "\"EUR\")");
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert!(h.state().app.editor.is_none());
+    assert_eq!(value(&h.state().app, "B3"), Value::Text("EUR found".into()));
+
+    h.state_mut().app.run("selection.set", json!({"range": "C4"})).unwrap();
+    h.get_by_label("Euro Rate").click();
+    h.run_steps(3);
+    assert!(h.state().app.editor.is_none());
+    assert_eq!(value(&h.state().app, "C4"), Value::Number(3.0));
+    let formula = h.state().app.session.active().unwrap().wb.active().unwrap().cell(CellRef::parse("C4").unwrap()).unwrap().input_text();
+    assert_eq!(formula, "=CONTOSO.RATE(\"EUR\")");
+
+    // A name no formula can call is reported, not started.
+    h.get_by_label("Misspelt").click();
+    h.run_steps(3);
+    assert!(h.state().app.editor.is_none());
+    assert!(h.state().app.message.as_ref().is_some_and(|(_, m)| m.contains("CONTOSO.LOKUP")), "{:?}", h.state().app.message);
+    h.state_mut().app.message = None;
+    h.run_steps(2);
+
+    // The host's own menu runs it while its field has the keyboard: the sheet takes the keyboard
+    // for the formula, and the host's field keeps its text.
+    let note = h.state().note_rect.center();
+    click_at(&mut h, note);
+    type_text(&mut h, "memo");
+    assert!(!h.state().app.has_keyboard());
+    h.state_mut().app.run("selection.set", json!({"range": "D5"})).unwrap();
+    h.state_mut().app.run("formulas.insertFunction", json!({"name": "contoso.rate"})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().app.has_keyboard());
+    type_text(&mut h, "\"GBP\")");
+    key(&mut h, Key::Enter, Modifiers::NONE);
+    assert_eq!(h.state().note, "memo");
+    assert_eq!(value(&h.state().app, "D5"), Value::Number(3.0));
+
+    // A workbook the host stores, saved where its functions were unknown, opens calculated.
+    let mut source = session();
+    source.execute("cell.set", json!({"cell": "A1", "input": "=CONTOSO.RATE(\"YEN\")*2"})).unwrap();
+    let b64 = source.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap()["base64"].as_str().unwrap().to_string();
+    let bytes = gridcraft_engine::io::base64_decode(&b64).unwrap();
+    h.state_mut().app.open_workbook_bytes("Rates.xlsx", &bytes, None).unwrap();
+    h.run_steps(2);
+    assert_eq!(h.state().app.session.active().unwrap().display_title(), "Rates.xlsx");
+    assert_eq!(value(&h.state().app, "A1"), Value::Number(6.0));
 }
 
 #[test]

@@ -22,8 +22,9 @@ Excel's worksheet functions, category by category, against GridCraft's function 
   MAKEARRAY…), excluding the test-only `ADD2`. Every one is an Excel name.
 - **Not counted either:** functions an application embedding GridCraft provides under its own
   namespace (`CONTOSO.LOOKUP`, [host functions](architecture.md#host-functions)). They are
-  listed by `formulas.functions` with the category `UserDefined`; a namespace never shadows a
-  built-in function.
+  listed by `formulas.functions` with the category `UserDefined` and offered by the formula
+  editor (AutoComplete, argument hints, Insert Function) from the host's catalog; a namespace
+  never shadows a built-in function.
 - **Not on Microsoft's list:** USDOLLAR, a legacy function Excel still evaluates (like DOLLAR),
   is in our library as a Compatibility function for files that use it. It is not counted above.
 - **Working** excludes stubs that return an error by design: the 7 CUBE functions (`#N/A`, no

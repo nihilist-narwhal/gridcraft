@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** minor (§21: host functions, a custom-function API for embedding applications) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-14 · **Change:** minor (§21: host functions in AutoComplete, argument hints and Insert Function; previously minor: host functions, a custom-function API for embedding applications) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -153,8 +153,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - VBA out of scope (dropped on open, #6); no Office Scripts compatibility. An application that
   embeds GridCraft can add namespaced worksheet functions ([host functions](architecture.md#host-functions):
   arrays that spill, pending data, XLSX round trip with cached values), but there is no
-  user-installable plugin or custom-function format (LAMBDA libraries, WASM functions) and the
-  formula-bar autocomplete and Insert Function dialog don't list host functions yet.
+  user-installable plugin or custom-function format (LAMBDA libraries, WASM functions). The
+  formula editor's AutoComplete, argument hints and Insert Function list host functions.
   **Estimate:** 20–35 h plus an owner decision.
 
 ### 22. AI features (F)
@@ -172,6 +172,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | §21: AutoComplete, argument hints and Insert Function list host functions; user plugins remain |
 | 2026-10-14 | minor | §21: host functions give embedding applications a custom-function API; user plugins and the UI listing remain |
 | 2026-10-12 | minor | rows auto-fit oversized fonts on open and whole-row/column formatting (#833) |
 | 2026-10-12 | minor | Page Layout view: dragging margins on the rulers (#792) removed from the §14 remainder |

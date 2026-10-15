@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use gridcraft_core::{Array, CellError, CellRef, Value};
 use gridcraft_engine::calc::Calc;
 use gridcraft_engine::model::Workbook;
-use gridcraft_engine::{EngineError, HostArg, HostFunctionInfo, HostFunctions, HostResult, Session};
+use gridcraft_engine::{EngineError, HostArg, HostFunctionInfo, HostFunctions, HostResult, Session, UiRequest};
 use serde_json::{Value as Json, json};
 
 /// A host with data that arrives late: `QUOTE` is pending until [`Contoso::ready`].
@@ -218,6 +218,37 @@ fn the_function_list_and_evaluate_know_host_functions() {
     set(&mut s, "A1", "=SUM(CONTOSO.SEQ(3))*2");
     let steps = s.execute("formulas.evaluateFormula", json!({"cell": "A1"})).unwrap();
     assert_eq!(steps["result"], json!(12.0));
+}
+
+#[test]
+fn insert_function_starts_a_host_formula_in_the_active_cell() {
+    let (mut s, _) = session();
+    s.execute("selection.set", json!({"range": "C3"})).unwrap();
+    // What a host's ribbon button runs: the formula opens in the active cell for its arguments.
+    let r = s.execute("formulas.insertFunction", json!({"name": "contoso.quote"})).unwrap();
+    assert_eq!(r, json!({"formula": "=CONTOSO.QUOTE("}));
+    assert_eq!(s.take_ui_requests(), [UiRequest::EditCell(Some("=CONTOSO.QUOTE(".into()))]);
+    // Built-in functions and LAMBDA names as before.
+    s.execute("formulas.insertFunction", json!({"name": "vlookup"})).unwrap();
+    s.execute("formulas.insertFunction", json!({"name": "IF"})).unwrap();
+    s.execute("formulas.defineName", json!({"name": "Twice", "refersTo": "=LAMBDA(x,x*2)"})).unwrap();
+    s.execute("formulas.insertFunction", json!({"name": "Twice"})).unwrap();
+    assert_eq!(s.take_ui_requests().len(), 3);
+    // A name no formula can call is refused, and nothing opens.
+    for name in ["CONTOSO.NOPE", "FABRIKAM.QUOTE", "SUM(1)+X", "", "=", "_xludf."] {
+        assert!(matches!(s.execute("formulas.insertFunction", json!({"name": name})), Err(EngineError::BadParams { .. })), "{name:?}");
+    }
+    assert!(s.take_ui_requests().is_empty());
+    // Without the host, its functions are unknown too.
+    assert!(s.unregister_host_functions("contoso"));
+    assert!(s.execute("formulas.insertFunction", json!({"name": "CONTOSO.QUOTE"})).is_err());
+    // A complete host formula goes into the active cell with `cell.set` and no `cell`.
+    let (mut s, host) = session();
+    host.ready();
+    s.execute("selection.set", json!({"range": "B2"})).unwrap();
+    s.execute("cell.set", json!({"input": "=CONTOSO.SEQ(2)"})).unwrap();
+    assert_eq!(value(&s, "B2"), Value::Number(1.0));
+    assert_eq!(value(&s, "B3"), Value::Number(2.0));
 }
 
 fn save(s: &mut Session) -> String {

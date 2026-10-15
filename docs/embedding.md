@@ -1,6 +1,6 @@
 # Embedding the sheet in another application
 
-> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (keyboard and font fixes from review: focus moves inside the sheet, kept keys keep their text, quit shortcuts, host font sets)
+> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (the host's worksheet functions in the formula editor, and ribbon buttons that insert them; previously minor: keyboard and font fixes from review)
 
 `gridcraft-ui-egui`'s `SheetApp::ui(&mut egui::Ui)` draws the whole spreadsheet into any egui
 region. An egui application (the *host*) can show it as one panel of its own window, in its own
@@ -90,7 +90,9 @@ With `KeyboardScope::Focus` the sheet handles keys only while it *has the keyboa
   Focus that egui moves between the sheet's own widgets (Shift+Tab between the fields of one of
   its dialogs) leaves it with the sheet;
 - `SheetApp::focus_keyboard()` / `release_keyboard()` hand it over explicitly, and
-  `has_keyboard()` tells who has it. Keys sent over the control channel give it to the sheet.
+  `has_keyboard()` tells who has it. Keys sent over the control channel give it to the sheet,
+  and so does a command that opens the cell editor for typing (`formulas.insertFunction` with a
+  name, `formulas.autoSum` without a range), whoever runs it.
 
 Without the keyboard the sheet sees no key, text, copy, cut, paste or IME event, never grabs
 egui's focus, and its shortcuts and keytips (Alt, F10) stay off. The events are taken out only
@@ -161,6 +163,36 @@ command search, `engine.execute` and `engine.commands` on the control channel (`
 with its ribbon path) all reach it. A command that runs itself again gets an error instead of
 recursing; one that unregisters itself while it runs is gone once it finishes.
 
+## Worksheet functions
+
+A host's own worksheet functions (`=CONTOSO.LOOKUP(A1)`) are registered on the engine's
+`Session` with `Session::register_host_functions` (see [architecture.md](architecture.md#host-functions));
+the sheet needs nothing more to calculate them. Its formula editor (in the cell and in the
+formula bar) treats them like built-in functions, from the host's catalog (`HostFunctionInfo`):
+
+- AutoComplete offers them, sorted among the built-in functions, with their description; Tab or
+  a click inserts `CONTOSO.LOOKUP(`;
+- inside the parentheses the argument hint shows the signature (`CONTOSO.LOOKUP(key,
+  [column])`, the argument being typed in bold, in the language's list separator), the
+  function's description, and the description of the argument being typed (`key: The key to
+  look up.`) when the catalog gives one;
+- Insert Function lists them under the category `UserDefined`.
+
+A ribbon tab (or any host control) puts one in the active cell with a command:
+
+```rust
+RibbonGroup::new("Data")
+    // Starts =CONTOSO.LOOKUP( in the active cell; the user types the arguments with the hint.
+    .button(RibbonButton::new("Lookup", "formulas.insertFunction").params(json!({"name": "CONTOSO.LOOKUP"})))
+    // Writes a complete formula into the active cell (`cell.set` without `cell`).
+    .button(RibbonButton::new("Euro Rate", "cell.set").params(json!({"input": "=CONTOSO.RATE(\"EUR\")"})))
+```
+
+`formulas.insertFunction` refuses a name no formula can call (not built in, not a registered
+host function, not a defined name), so a misspelt button shows an error instead of starting a
+`#NAME?` formula. A formula built from the selection (`=CONTOSO.LOOKUP(B2:B9)`) is a
+`HostCommand` that reads it and runs `cell.set`.
+
 ## Workbooks the host stores
 
 - `open_workbook_bytes(name, bytes, password)` opens any format `file.open` reads and shows it,
@@ -197,3 +229,4 @@ the keyboard.
 |---|---|---|
 | 2026-10-14 | major | Created: embed options, keyboard scope and reserved shortcuts, host theme, host ribbon tabs and commands, workbook bytes in and out |
 | 2026-10-14 | minor | Review fixes: Shift+Tab inside the sheet's dialogs keeps the keyboard, kept keys keep their text and don't arm keytips, quit shortcuts stay the host's, host font sets and `Services::fonts` can't remove the sheet's families, a running command can unregister itself; agents and the control channel |
+| 2026-10-14 | minor | Worksheet functions: the host's functions in AutoComplete, argument hints and Insert Function; ribbon buttons that insert them; commands that open the cell editor take the keyboard |
