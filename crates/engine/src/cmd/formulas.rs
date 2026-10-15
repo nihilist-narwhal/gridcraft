@@ -26,7 +26,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             insert_function
         ),
-        cmd!(query "formulas.functions", "List Functions", [], None, "{category?, search?} → [{name, category, signature, description}]", always, list_functions),
+        cmd!(
+            query "formulas.functions",
+            "List Functions",
+            [],
+            None,
+            "{category?, search?} → [{name, category, signature, description}]; functions of the embedding application have category \"UserDefined\" and also {namespace, args: [{name, description, optional}], volatile}",
+            always,
+            list_functions
+        ),
         cmd!(
             "formulas.defineName",
             "Define Name…",
@@ -55,6 +63,17 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "formulas.evaluateFormula", "Evaluate Formula", ["Formulas", "Formula Auditing"], None, "{cell?, formula?} → steps", has_doc, evaluate_formula),
         cmd!(query "formulas.evaluate", "Evaluate", [], None, "{formula: \"=SUM(A1:A3)\", cell?} → value without changing the sheet", has_doc, evaluate),
         cmd!(noundo "formulas.calculateNow", "Calculate Now", ["Formulas", "Calculation"], Some("F9"), "{}", has_doc, calc_now),
+        // Not journaled: a host reports new data as often as it arrives, which is no user action
+        // to record or replay. Recalculates; changes no formula or constant.
+        cmd!(
+            query "formulas.refreshHostFunctions",
+            "Refresh Host Functions",
+            [],
+            None,
+            "{namespace?: \"CONTOSO\"} recalculates, in every open workbook, the formulas calling functions of that namespace (default: of every registered namespace) and their dependents, e.g. when the embedding application's data for them is ready → {cells}",
+            always,
+            refresh_host_functions
+        ),
         cmd!(noundo "formulas.calculateSheet", "Calculate Sheet", ["Formulas", "Calculation"], Some("Shift+F9"), "{}", has_doc, calc_now),
         cmd!(
             "formulas.calculationOptions",
@@ -207,10 +226,31 @@ pub fn function_list() -> Vec<Json> {
     v
 }
 
-fn list_functions(_: &mut Session, p: &Json) -> Result<Json> {
+/// The functions of the embedding application, as [`function_list`] lists functions.
+pub fn host_function_list(hosts: &gridcraft_calc::HostFunctionRegistry) -> Vec<Json> {
+    hosts
+        .functions()
+        .map(|f| {
+            let args: Vec<Json> = f.info.args.iter().map(|a| json!({"name": a.name, "description": a.description, "optional": a.optional})).collect();
+            json!({
+                "name": f.full_name(),
+                "category": "UserDefined",
+                "signature": f.info.signature(f.namespace),
+                "description": f.info.description,
+                "namespace": f.namespace,
+                "args": args,
+                "volatile": f.info.volatile,
+            })
+        })
+        .collect()
+}
+
+fn list_functions(s: &mut Session, p: &Json) -> Result<Json> {
     let cat = str_param(p, "category").map(str::to_ascii_lowercase);
     let q = str_param(p, "search").map(str::to_ascii_lowercase);
-    let v: Vec<Json> = function_list()
+    let mut all = function_list();
+    all.extend(host_function_list(s.host_functions()));
+    let v: Vec<Json> = all
         .into_iter()
         .filter(|f| cat.as_ref().is_none_or(|c| f["category"].as_str().is_some_and(|x| x.to_ascii_lowercase() == *c)))
         .filter(|f| {
@@ -533,10 +573,10 @@ fn evaluate_formula(s: &mut Session, p: &Json) -> Result<Json> {
         }
     });
     for e in nodes.into_iter().rev().take(200) {
-        let v = gridcraft_calc::recalc::evaluate_expr(&d.wb, sheet, at, &e);
+        let v = gridcraft_calc::recalc::evaluate_expr_with(&d.wb, sheet, at, &e, Some(d.calc.host_functions().clone()));
         steps.push(json!({"expression": gridcraft_formula::print(&e), "value": crate::cmd::inspect::value_json(&v)}));
     }
-    let result = gridcraft_calc::recalc::evaluate_expr(&d.wb, sheet, at, &expr);
+    let result = gridcraft_calc::recalc::evaluate_expr_with(&d.wb, sheet, at, &expr, Some(d.calc.host_functions().clone()));
     Ok(json!({"formula": format!("={text}"), "steps": steps, "result": crate::cmd::inspect::value_json(&result)}))
 }
 
@@ -544,8 +584,13 @@ fn evaluate(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let f = str_param(p, "formula").ok_or_else(|| bad("formulas.evaluate", "missing `formula`"))?;
     let at = cell_param(s, p, "cell")?.unwrap_or(d.selection.active);
-    let v = gridcraft_calc::evaluate(&d.wb, d.wb.active_sheet, at, f);
+    let v = d.calc.evaluate(&d.wb, d.wb.active_sheet, at, f);
     Ok(crate::cmd::inspect::value_json(&v))
+}
+
+fn refresh_host_functions(s: &mut Session, p: &Json) -> Result<Json> {
+    let cells = crate::host_functions::refresh(s, str_param(p, "namespace"));
+    Ok(json!({"cells": cells}))
 }
 
 fn calc_now(s: &mut Session, _: &Json) -> Result<Json> {

@@ -18,6 +18,9 @@
 //!   (catches stale dependency graphs);
 //! - every few steps and at the end, an XLSX save and reload (with the recalculation opening does)
 //!   gives the same sheets, formulas and values;
+//! - formulas may call functions of the embedding application: a `CONTOSO` host is registered
+//!   (scalars, spilling arrays, ranges as arguments), and calls of an unregistered namespace are
+//!   unknown functions;
 //! - at the end, undoing everything gives back the starting workbook and redoing everything the
 //!   final one (view state aside), and both keep the Watch Window list, which isn't an edit.
 //!
@@ -33,9 +36,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value, col_to_letters};
-use gridcraft_engine::calc::Calc;
+use gridcraft_engine::calc::{Calc, HostFunctionRegistry};
+use gridcraft_engine::core::CellError;
 use gridcraft_engine::model::{CalcMode, Formula, Sheet, Workbook};
-use gridcraft_engine::{EngineError, Session, command_specs, find_command, io};
+use gridcraft_engine::{EngineError, HostArg, HostFunctionInfo, HostFunctions, HostResult, Session, command_specs, find_command, io};
 use serde_json::{Value as Json, json};
 
 const SAMPLES: [&str; 3] = ["sales", "budget", "grades"];
@@ -91,6 +95,53 @@ impl Rng {
     fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.below(xs.len())]
     }
+}
+
+// ---------------------------------------------------------------- host functions
+
+/// The embedding application's functions the sequences call: pure, so recalculating from scratch
+/// must agree with the incremental state.
+struct Contoso;
+
+impl HostFunctions for Contoso {
+    fn namespace(&self) -> &str {
+        "CONTOSO"
+    }
+    fn catalog(&self) -> Vec<HostFunctionInfo> {
+        vec![
+            HostFunctionInfo::new("ADD", "a + b").arg("a", "").arg("b", ""),
+            HostFunctionInfo::new("SEQ", "1..n down a column").arg("n", ""),
+            HostFunctionInfo::new("MEAN", "mean of the numbers in a range").arg("values", ""),
+        ]
+    }
+    fn call(&self, name: &str, args: &[HostArg]) -> HostResult {
+        let num = |i: usize| args.get(i).and_then(HostArg::value).map(|v| v.to_number());
+        match name {
+            "ADD" => match (num(0), num(1)) {
+                (Some(Ok(a)), Some(Ok(b))) => (a + b).into(),
+                _ => CellError::Value.into(),
+            },
+            "SEQ" => match num(0) {
+                Some(Ok(n)) if (1.0..=50.0).contains(&n) => {
+                    HostResult::Array(gridcraft_engine::core::Array::column((1..=n as usize).map(|i| Value::Number(i as f64)).collect()))
+                }
+                _ => CellError::Num.into(),
+            },
+            "MEAN" => {
+                let values: Vec<f64> = match args.first().and_then(HostArg::value) {
+                    Some(Value::Array(a)) => a.data.iter().filter_map(Value::as_f64).collect(),
+                    Some(v) => v.as_f64().into_iter().collect(),
+                    None => vec![],
+                };
+                if values.is_empty() { CellError::Div0.into() } else { (values.iter().sum::<f64>() / values.len() as f64).into() }
+            }
+            _ => CellError::Name.into(),
+        }
+    }
+}
+
+fn hosts_of(s: &Session) -> Arc<HostFunctionRegistry> {
+    s.host_functions().clone()
 }
 
 // ---------------------------------------------------------------- harness
@@ -241,6 +292,7 @@ fn guarded<T>(step: usize, kind: &'static str, f: impl FnOnce() -> Result<T, Str
 impl Harness {
     fn new(sample: &str) -> Harness {
         let mut s = Session::new();
+        s.register_host_functions(Arc::new(Contoso)).expect("host registers");
         s.execute("file.new", json!({"sample": sample})).expect("sample opens");
         let base = s.doc().expect("document").wb.clone();
         Harness { s, base }
@@ -270,7 +322,8 @@ impl Harness {
         }
         self.check_state(i)?;
         if (i + 1).is_multiple_of(ROUNDTRIP_EVERY) {
-            guarded(i, "xlsx roundtrip", || roundtrip_diff(&after))?;
+            let hosts = hosts_of(&self.s);
+            guarded(i, "xlsx roundtrip", || roundtrip_diff(&after, hosts))?;
         }
         if self.s.doc().expect("document").undo.len() >= EPISODE_UNDO_DEPTH {
             self.end_episode(i)?;
@@ -285,7 +338,8 @@ impl Harness {
             return Err(fail(i, "structure", e));
         }
         let wb = d.wb.clone();
-        guarded(i, "recalc", || recalc_diff(&wb))
+        let hosts = hosts_of(&self.s);
+        guarded(i, "recalc", || recalc_diff(&wb, hosts))
     }
 
     /// Undo everything, compare with the start, redo everything, compare with the end, then save
@@ -320,7 +374,8 @@ impl Harness {
             return Err(fail(i, "redo", format!("redoing all {n} steps doesn't give back the final workbook: {diff}")));
         }
         self.check_state(i)?;
-        guarded(i, "xlsx roundtrip", || roundtrip_diff(&end))?;
+        let hosts = hosts_of(&self.s);
+        guarded(i, "xlsx roundtrip", || roundtrip_diff(&end, hosts))?;
         let d = self.s.active_mut().expect("document");
         d.undo.clear();
         d.redo.clear();
@@ -441,13 +496,20 @@ fn value_diff(a: &Workbook, b: &Workbook, what: &str) -> Option<String> {
     None
 }
 
+/// A calculation with the session's host functions.
+fn calc_with(hosts: Arc<HostFunctionRegistry>) -> Calc {
+    let mut calc = Calc::new();
+    calc.set_host_functions(hosts);
+    calc
+}
+
 /// A full recalculation from scratch must agree with the incrementally maintained values.
-fn recalc_diff(wb: &Workbook) -> Result<(), String> {
+fn recalc_diff(wb: &Workbook, hosts: Arc<HostFunctionRegistry>) -> Result<(), String> {
     if wb.calc.mode != CalcMode::Automatic || wb.calc.iterative {
         return Ok(());
     }
     let mut fresh = wb.clone();
-    Calc::new().recalc_all(&mut fresh);
+    calc_with(hosts).recalc_all(&mut fresh);
     value_diff(wb, &fresh, "a full recalc").map_or(Ok(()), Err)
 }
 
@@ -457,10 +519,10 @@ fn normalized_formula(f: &Formula) -> String {
 }
 
 /// Save to XLSX, reload (recalculating like opening does) and compare sheets, formulas and values.
-fn roundtrip_diff(wb: &Workbook) -> Result<(), String> {
+fn roundtrip_diff(wb: &Workbook, hosts: Arc<HostFunctionRegistry>) -> Result<(), String> {
     let bytes = io::save_bytes(wb, "fuzz.xlsx").map_err(|e| format!("save failed: {e}"))?;
     let (mut back, _) = io::open_bytes("fuzz.xlsx", &bytes).map_err(|e| format!("reload failed: {e}"))?;
-    Calc::new().recalc_all(&mut back);
+    calc_with(hosts).recalc_loaded(&mut back);
     let names = |wb: &Workbook| wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
     if names(wb) != names(&back) {
         return Err(format!("sheets {:?} reload as {:?}", names(wb), names(&back)));
@@ -618,7 +680,11 @@ fn formula(rng: &mut Rng, wb: &Workbook) -> String {
     let n = rng.int(1, 6);
     let col = letter(rng.int(0, 9) as u32);
     let tabs = tables(wb);
-    match rng.below(30) {
+    match rng.below(34) {
+        30 => format!("=CONTOSO.ADD({c},{n})"),
+        31 => format!("=CONTOSO.SEQ({n})"),
+        32 => format!("=CONTOSO.MEAN({r})+{c}"),
+        33 => rng.pick(&["=_xludf.CONTOSO.ADD(1,2)", "=FABRIKAM.LOOKUP(1)", "=contoso.seq(3)*2", "=CONTOSO.NOPE()"]).to_string(),
         0 => format!("={c}+{n}"),
         1 => format!("=SUM({r})"),
         2 => format!("={c}*{c2}"),
@@ -784,6 +850,7 @@ const CURATED: &[(&str, usize)] = &[
     ("formulas.defineName", 2),
     ("formulas.deleteName", 1),
     ("edit.replace", 1),
+    ("formulas.refreshHostFunctions", 1),
 ];
 
 fn generate(rng: &mut Rng, s: &Session) -> Step {
@@ -928,6 +995,11 @@ fn curated_params(rng: &mut Rng, wb: &Workbook, id: &str) -> Json {
             None => json!({"name": "Nope"}),
         },
         "edit.replace" => json!({"what": rng.pick(&["North", "1", "A", "Sales"]), "with": rng.pick(&["South", "2", "B", ""]), "all": true}),
+        "formulas.refreshHostFunctions" => match rng.below(3) {
+            0 => json!({}),
+            1 => json!({"namespace": "contoso"}),
+            _ => json!({"namespace": "FABRIKAM"}),
+        },
         _ => maybe_range(rng),
     }
 }

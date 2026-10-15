@@ -609,6 +609,7 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
+    crate::host_functions::recalc_restored(d);
     d.revision += 1;
     Ok(json!({"undone": label}))
 }
@@ -628,6 +629,7 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
+    crate::host_functions::recalc_restored(d);
     d.revision += 1;
     Ok(json!({"redone": label}))
 }

@@ -177,7 +177,10 @@ impl Scan<'_> {
             "FILTER" | "SORT" | "SORTBY" | "UNIQUE" | "SEQUENCE" | "RANDARRAY" | "VSTACK" | "HSTACK" | "TOROW" | "TOCOL" | "WRAPROWS"
             | "WRAPCOLS" | "TAKE" | "DROP" | "CHOOSEROWS" | "CHOOSECOLS" | "EXPAND" | "GROUPBY" | "PIVOTBY" | "TRANSPOSE" | "MMULT" | "MINVERSE"
             | "FREQUENCY" | "LINEST" | "LOGEST" | "TREND" | "GROWTH" | "MAP" | "SCAN" | "BYROW" | "BYCOL" | "MAKEARRAY" | "ANCHORARRAY" => true,
-            _ => lifted || self.wb.name(name, sheet).is_some(),
+            // A user-defined function (`CONTOSO.LOOKUP`) may return an array: files mark its
+            // formulas as array formulas, or Excel shows them as `=@CONTOSO.LOOKUP(…)` and keeps
+            // one value.
+            _ => lifted || self.wb.name(name, sheet).is_some() || crate::tables::is_user_defined_function(name),
         };
         Shape { array, affected }
     }

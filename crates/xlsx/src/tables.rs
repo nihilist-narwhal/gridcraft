@@ -259,6 +259,28 @@ const FUTURE_FUNCTIONS: &[&str] = &[
     "_xlws.SORT",
 ];
 
+/// Excel worksheet functions with a dot in their name that files store without the `_xlfn.`
+/// prefix (every other dotted one is in [`FUTURE_FUNCTIONS`]).
+const LEGACY_DOTTED_FUNCTIONS: &[&str] = &["ERROR.TYPE", "ISO.CEILING", "REGISTER.ID"];
+
+/// Whether a function name (as the model spells it, without `_xlfn.`) is a user-defined
+/// function by the file format's conventions: it carries the `_xludf.` or `_xll.` prefix, or it is
+/// a namespaced name (`CONTOSO.LOOKUP`, how add-ins and embedding applications name their
+/// functions) that isn't an Excel worksheet function. Files store such calls by their plain name;
+/// what they return (one value or an array) is only known to whoever provides them.
+pub fn is_user_defined_function(name: &str) -> bool {
+    let u = name.to_ascii_uppercase();
+    if u.starts_with("_XLUDF.") || u.starts_with("_XLL.") {
+        return true;
+    }
+    let Some((namespace, rest)) = u.split_once('.') else { return false };
+    !namespace.is_empty()
+        && !rest.is_empty()
+        && !namespace.starts_with('_')
+        && file_function_name(&u).is_none()
+        && !LEGACY_DOTTED_FUNCTIONS.contains(&u.as_str())
+}
+
 /// The name to write for a function (`XLOOKUP` → `_xlfn.XLOOKUP`, `FILTER` → `_xlfn._xlws.FILTER`).
 pub fn file_function_name(name: &str) -> Option<String> {
     let u = name.to_ascii_uppercase();
@@ -334,6 +356,12 @@ mod tests {
         assert_eq!(file_function_name("PERCENTOF").as_deref(), Some("_xlfn.PERCENTOF"));
         assert_eq!(file_function_name("TRIMRANGE").as_deref(), Some("_xlfn.TRIMRANGE"));
         assert_eq!(file_function_name("SUM"), None);
+        for udf in ["CONTOSO.LOOKUP", "contoso.stats.mean", "_xludf.SUM", "_xludf.CONTOSO.X", "_XLL.MYFN"] {
+            assert!(is_user_defined_function(udf), "{udf}");
+        }
+        for builtin in ["SUM", "NORM.DIST", "norm.s.dist", "FORECAST.ETS.CONFINT", "ERROR.TYPE", "ISO.CEILING", "MYFN", "_xlpm.X", "A.", ".B"] {
+            assert!(!is_user_defined_function(builtin), "{builtin}");
+        }
         assert_eq!(builtin_format(14), Some("m/d/yyyy"));
         assert_eq!(builtin_id("0.00%"), Some(10));
         assert_eq!(builtin_id(builtin_format(5).unwrap()), None);

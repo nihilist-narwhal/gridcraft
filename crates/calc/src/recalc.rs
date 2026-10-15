@@ -40,11 +40,14 @@ impl Hasher for FxHasher {
 type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 
+use std::sync::Arc;
+
 use gridcraft_core::{Array, CellError, CellRef, RangeRef, Value};
 use gridcraft_formula::Expr;
 use gridcraft_model::{CalcMode, Workbook};
 
-use crate::eval::{Area, Evaluator, Host, precedents};
+use crate::eval::{Area, Evaluator, Host, analyze};
+use crate::host::HostFunctionRegistry;
 
 pub type Key = (usize, CellRef);
 
@@ -52,6 +55,15 @@ pub type Key = (usize, CellRef);
 struct Node {
     areas: Vec<Area>,
     dynamic: bool,
+    /// Namespaces of the namespaced functions it calls (see [`crate::eval::Analysis`]).
+    namespaces: Box<[Box<str>]>,
+}
+
+impl Node {
+    fn of(wb: &Workbook, sheet: usize, e: &Expr, hosts: &HostFunctionRegistry) -> Node {
+        let a = analyze(wb, sheet, e, Some(hosts));
+        Node { areas: a.areas, dynamic: a.dynamic, namespaces: a.namespaces.into_iter().map(String::into_boxed_str).collect() }
+    }
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -196,6 +208,9 @@ pub struct Graph {
     /// sheet → row intervals of wider ranges, with their columns: (first, last, dependent)
     wide_deps: HashMap<usize, Intervals<(u32, u32, Key)>>,
     dynamic: HashSet<Key>,
+    /// Namespace (upper case) → formulas calling its functions, so a host's new data recalculates
+    /// just those formulas and their dependents.
+    host_calls: HashMap<Box<str>, HashSet<Key>>,
     /// Range indexes changed since the last [`Graph::settle`].
     unsettled_cols: HashSet<(usize, u32)>,
     unsettled_wide: HashSet<usize>,
@@ -250,6 +265,9 @@ impl Graph {
         if node.dynamic {
             self.dynamic.insert(k);
         }
+        for ns in &node.namespaces {
+            self.host_calls.entry(ns.clone()).or_default().insert(k);
+        }
         self.nodes.insert(k, node);
     }
 
@@ -277,6 +295,14 @@ impl Graph {
             }
         }
         self.dynamic.remove(&k);
+        for ns in &old.namespaces {
+            if let Some(v) = self.host_calls.get_mut(ns) {
+                v.remove(&k);
+                if v.is_empty() {
+                    self.host_calls.remove(ns);
+                }
+            }
+        }
     }
 
     /// Tidies the range indexes changed by `insert`/`remove` (queries stay correct without it,
@@ -359,6 +385,18 @@ impl Graph {
     pub fn precedents_of(&self, k: Key) -> Vec<Area> {
         self.nodes.get(&k).map(|n| n.areas.clone()).unwrap_or_default()
     }
+
+    /// Formulas that call functions of `namespace` (ignoring case), or of any namespace, sorted.
+    /// Whether a host is registered for the namespace doesn't matter.
+    pub fn host_callers(&self, namespace: Option<&str>) -> Vec<Key> {
+        let mut v: Vec<Key> = match namespace {
+            Some(ns) => self.host_calls.get(ns.to_ascii_uppercase().as_str()).map(|s| s.iter().copied().collect()).unwrap_or_default(),
+            None => self.host_calls.values().flatten().copied().collect(),
+        };
+        v.sort_unstable_by_key(|(s, c)| (*s, c.row, c.col));
+        v.dedup();
+        v
+    }
 }
 
 /// Calculation state kept beside a workbook.
@@ -371,13 +409,19 @@ pub struct Calc {
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// Functions the embedding application provides ([`crate::host`]).
+    hosts: Arc<HostFunctionRegistry>,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0, hosts: Arc::default() }
     }
 }
+
+/// The arrays a file cached, set aside while a workbook just read is calculated
+/// ([`Calc::recalc_loaded`]): per sheet, the spill ranges by anchor and the spilled values.
+type CachedSpills = HashMap<usize, (std::collections::BTreeMap<CellRef, RangeRef>, std::collections::BTreeMap<CellRef, Value>)>;
 
 struct PassHost<'a> {
     wb: &'a Workbook,
@@ -408,6 +452,13 @@ struct PassHost<'a> {
     tainted: HashSet<Key>,
     /// Whether the formula being evaluated has read a previous value.
     taint: bool,
+    /// Functions of the embedding application.
+    hosts: Option<Arc<HostFunctionRegistry>>,
+    /// Loading a file: a formula that calls something unavailable keeps the value the file
+    /// cached (these are the cached arrays; scalars are still in the workbook during the pass).
+    keep: Option<&'a CachedSpills>,
+    /// Whether the formula being evaluated has called something unavailable.
+    unavailable: bool,
 }
 
 impl<'a> PassHost<'a> {
@@ -431,6 +482,9 @@ impl<'a> PassHost<'a> {
             members: HashSet::default(),
             tainted: HashSet::default(),
             taint: false,
+            hosts: None,
+            keep: None,
+            unavailable: false,
         }
     }
 }
@@ -483,10 +537,16 @@ impl PassHost<'_> {
             self.stack.push(k);
         }
         let expr = std::sync::Arc::clone(expr);
+        let outer_unavailable = std::mem::replace(&mut self.unavailable, false);
         let v = {
             let mut ev = Evaluator::new(self, k.0, k.1);
             ev.value(&expr)
         };
+        let v = match self.unavailable.then(|| self.cached_value(k)).flatten() {
+            Some(cached) => cached,
+            None => v,
+        };
+        self.unavailable = outer_unavailable;
         // A legacy array formula fills the range it was entered in.
         let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.array);
         let v = match legacy {
@@ -535,6 +595,24 @@ impl PassHost<'_> {
         };
         self.results.insert(k, v.clone());
         v
+    }
+
+    /// The value the file cached for formula `k`, its spilled values included, when loading
+    /// (`None`: not loading, or nothing cached). The scalar is still in the workbook during the
+    /// pass; the spilled values were set aside.
+    fn cached_value(&self, k: Key) -> Option<Value> {
+        let cached = self.keep?;
+        let v = self.wb.sheet(k.0)?.cell(k.1)?.value.clone();
+        if v.is_empty() {
+            return None;
+        }
+        let Some((ranges, values)) = cached.get(&k.0) else { return Some(v) };
+        let Some(range) = ranges.get(&k.1).filter(|r| !r.is_single() && r.start == k.1) else { return Some(v) };
+        if range.count() > crate::host::MAX_HOST_ARRAY_CELLS as u64 {
+            return Some(v);
+        }
+        let data = range.iter().map(|c| if c == k.1 { v.clone() } else { values.get(&c).cloned().unwrap_or_default() }).collect();
+        Some(Array::new(range.height() as usize, range.width() as usize, data).map(Value::from).unwrap_or(v))
     }
 
     /// A formula's previous value for iterative calculation: from the last iteration, else the
@@ -770,6 +848,12 @@ impl Host for PassHost<'_> {
     fn now_serial(&self) -> f64 {
         self.now
     }
+    fn host_functions(&self) -> Option<Arc<HostFunctionRegistry>> {
+        self.hosts.clone()
+    }
+    fn note_unavailable(&mut self) {
+        self.unavailable = true;
+    }
     fn random(&mut self) -> f64 {
         // xorshift64*
         let mut x = *self.rng;
@@ -793,6 +877,19 @@ impl Calc {
         now_serial()
     }
 
+    /// The functions of the embedding application that formulas can call.
+    pub fn host_functions(&self) -> &Arc<HostFunctionRegistry> {
+        &self.hosts
+    }
+
+    /// Sets the functions of the embedding application that formulas can call. Whether a call is
+    /// a (non-volatile) host function decides how often it is recalculated, so rebuild the graph
+    /// (or recalculate everything) afterwards, then [`Calc::recalc_host_calls`] for formulas
+    /// whose namespace changed.
+    pub fn set_host_functions(&mut self, hosts: Arc<HostFunctionRegistry>) {
+        self.hosts = hosts;
+    }
+
     /// Rebuilds the graph from scratch.
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.graph = Graph::default();
@@ -801,29 +898,85 @@ impl Calc {
                 if let Some(f) = &cell.formula
                     && let Some(e) = f.expr()
                 {
-                    let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic });
+                    let node = Node::of(wb, si, &e, &self.hosts);
+                    self.graph.insert((si, c), node);
                 }
             }
         }
         self.graph.settle();
     }
 
-    /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
+    /// Recalculates every formula (F9 / Ctrl+Alt+F9).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
+        self.recalc_everything(wb, false);
+    }
+
+    /// Recalculates a workbook just read from a file. Every formula is calculated, except that a
+    /// formula calling a function that isn't available keeps the value (and spilled values) the
+    /// file cached, as other spreadsheet applications show them until they recalculate: an
+    /// unknown function (an add-in's, or a host function whose host isn't registered) or a host
+    /// function whose data is still pending. Recalculating such a formula later gives `#NAME?`
+    /// (or `#GETTING_DATA`), like any unknown function. Formulas that read it use the cached value.
+    pub fn recalc_loaded(&mut self, wb: &mut Workbook) {
+        self.recalc_everything(wb, true);
+    }
+
+    /// Recalculates the formulas that call functions of `namespace` (ignoring case; registered or
+    /// not), or of every registered namespace, and their dependents, with the formulas
+    /// calculated every time as after any edit (in manual calculation, the namespace's formulas
+    /// only): a host reporting new data, a host registered or removed, a workbook restored by
+    /// undo whose host results may be out of date (pending then). Nothing is calculated when no
+    /// formula calls the namespace. Returns the number of formulas calculated.
+    pub fn recalc_host_calls(&mut self, wb: &mut Workbook, namespace: Option<&str>) -> usize {
+        let seeds = match namespace {
+            Some(ns) => self.graph.host_callers(Some(ns)),
+            None => {
+                let mut v: Vec<Key> = self.hosts.namespaces().flat_map(|ns| self.graph.host_callers(Some(ns))).collect();
+                v.sort_unstable_by_key(|(s, c)| (*s, c.row, c.col));
+                v.dedup();
+                v
+            }
+        };
+        self.recalc_seeds(wb, seeds)
+    }
+
+    fn recalc_seeds(&mut self, wb: &mut Workbook, seeds: Vec<Key>) -> usize {
+        if seeds.is_empty() {
+            return 0;
+        }
+        let dirty = if wb.calc.mode == CalcMode::Manual { seeds } else { self.dirty_closure(wb, &seeds) };
+        let n = dirty.len();
+        self.run(wb, dirty, false, None);
+        n
+    }
+
+    /// Evaluates a formula in the context of a cell without storing it, with this calculation's
+    /// host functions (see the free function [`evaluate`]).
+    pub fn evaluate(&self, wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Value {
+        let body = formula.strip_prefix('=').unwrap_or(formula);
+        let Ok(expr) = gridcraft_formula::parse(body) else { return Value::Error(CellError::Name) };
+        evaluate_expr_with(wb, sheet, at, &expr, Some(Arc::clone(&self.hosts)))
+    }
+
+    /// `loading`: [`Calc::recalc_loaded`].
+    fn recalc_everything(&mut self, wb: &mut Workbook, loading: bool) {
         self.rebuild(wb);
         // Spills are laid out again from the formulas where they are now (a structural edit moves
-        // or deletes the formulas, not the values they spilled).
+        // or deletes the formulas, not the values they spilled). Loading, the file's are set
+        // aside for formulas that keep their cached values.
+        let mut cached = CachedSpills::default();
         for i in 0..wb.sheets.len() {
             if wb.sheet(i).is_some_and(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty())
                 && let Some(sh) = wb.sheet_mut(i)
             {
-                sh.spill.clear();
-                sh.spill_ranges.clear();
+                let (ranges, values) = (std::mem::take(&mut sh.spill_ranges), std::mem::take(&mut sh.spill));
+                if loading {
+                    cached.insert(i, (ranges, values));
+                }
             }
         }
         let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
-        self.run(wb, all, true);
+        self.run(wb, all, true, loading.then_some(&cached));
     }
 
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
@@ -833,8 +986,8 @@ impl Calc {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
             match formula.and_then(|f| f.expr()) {
                 Some(e) => {
-                    let (areas, dynamic) = precedents(wb, k.0, &e);
-                    self.graph.insert(k, Node { areas, dynamic });
+                    let node = Node::of(wb, k.0, &e, &self.hosts);
+                    self.graph.insert(k, node);
                 }
                 None => {
                     self.graph.remove(k);
@@ -860,7 +1013,7 @@ impl Calc {
         if wb.calc.mode == CalcMode::Manual {
             // Only the edited formulas themselves are evaluated.
             let own: Vec<Key> = changed.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
-            self.run(wb, own, false);
+            self.run(wb, own, false, None);
             return;
         }
         let mut seeds: Vec<Key> = changed.to_vec();
@@ -908,7 +1061,7 @@ impl Calc {
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
         let n = dirty.len();
-        self.run(wb, dirty, false);
+        self.run(wb, dirty, false, None);
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("recalc: {} seeds, closure {} cells {:.1} ms, run {:.1} ms", seeds.len(), n, t1 - t0, prof_now() - t1);
         }
@@ -947,8 +1100,9 @@ impl Calc {
         seen.into_iter().collect()
     }
 
-    /// Evaluates the dirty set and writes results (and spills) back.
-    fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool) {
+    /// Evaluates the dirty set and writes results (and spills) back. `keep`: loading a file
+    /// ([`Calc::recalc_loaded`]).
+    fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, keep: Option<&CachedSpills>) {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         for _round in 0..8 {
             if dirty.is_empty() {
@@ -968,6 +1122,8 @@ impl Calc {
             let (results, spills, cycles) = {
                 let mut host = PassHost::new(wb, &exprs, &mut rng, now);
                 host.iterate = wb.calc.iterative;
+                host.hosts = Some(Arc::clone(&self.hosts));
+                host.keep = keep;
                 for k in &dirty {
                     host.compute(*k);
                 }
@@ -1023,6 +1179,11 @@ impl Calc {
                         if let Some(cell) = sheet.cells.get_mut(k.1) {
                             cell.value = Value::Error(CellError::Spill);
                         }
+                        // Blocked only by what was laid out since (another array of this pass):
+                        // the formulas that read the anchor's value in this pass read #SPILL! now.
+                        let mut deps = Vec::new();
+                        self.graph.dependents(k.0, k.1, &mut deps);
+                        spill_changes.extend(deps.into_iter().filter(|d| d != k));
                     } else {
                         for (i, c) in range.iter().enumerate() {
                             if c != k.1 {
@@ -1036,7 +1197,15 @@ impl Calc {
                 if let Some(r) = changed_range {
                     let mut deps = Vec::new();
                     self.graph.dependents_of_range(k.0, r, &mut deps);
-                    spill_changes.extend(deps.into_iter().filter(|d| d != k));
+                    // Not the anchor itself (that would read its own array), unless its old array
+                    // is gone or partly freed: its new formula may have read the old values, still
+                    // laid out while it was evaluated.
+                    let freed = match (old, sheet.spill_ranges.get(&k.1)) {
+                        (Some(o), Some(n)) => !(n.contains(o.start) && n.contains(o.end)),
+                        (_, None) => true,
+                        (None, Some(_)) => false,
+                    };
+                    spill_changes.extend(deps.into_iter().filter(|d| d != k || freed));
                 }
                 if let Some(o) = old
                     && !sheet.spill_ranges.get(&k.1).is_some_and(|n| n.contains(o.start) && n.contains(o.end))
@@ -1094,9 +1263,15 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 }
 
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
+    evaluate_expr_with(wb, sheet, at, expr, None)
+}
+
+/// [`evaluate_expr`] with the embedding application's functions.
+pub fn evaluate_expr_with(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr, hosts: Option<Arc<HostFunctionRegistry>>) -> Value {
     let exprs = HashMap::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
     let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial());
+    host.hosts = hosts;
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }

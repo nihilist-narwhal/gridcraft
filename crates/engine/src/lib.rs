@@ -12,6 +12,7 @@ mod clip_html;
 pub mod cmd;
 pub mod display;
 pub mod fill;
+mod host_functions;
 pub mod io;
 pub mod links;
 pub mod outline;
@@ -24,7 +25,7 @@ pub mod tables;
 
 use std::sync::Arc;
 
-use gridcraft_calc::Calc;
+use gridcraft_calc::{Calc, HostFunctionRegistry};
 use gridcraft_core::{CellRef, RangeRef};
 use gridcraft_model::Workbook;
 use serde::Serialize;
@@ -32,6 +33,7 @@ use serde_json::Value as Json;
 
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command, register_test_command};
 pub use gridcraft_calc as calc;
+pub use gridcraft_calc::{HostArg, HostArgInfo, HostFunctionError, HostFunctionInfo, HostFunctions, HostResult};
 pub use gridcraft_core as core;
 pub use gridcraft_formula as formula;
 pub use gridcraft_model as model;
@@ -118,9 +120,19 @@ static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 const UNDO_LIMIT: usize = 100;
 
 impl DocState {
-    pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
+    /// A document for a workbook just created or read from a file, calculated as opening does
+    /// ([`Calc::recalc_loaded`]), without host functions ([`Session::add_document`] adds the
+    /// session's).
+    pub fn new(wb: Workbook, path: Option<String>, title: String) -> DocState {
+        DocState::with_host_functions(wb, path, title, Arc::default())
+    }
+    /// [`DocState::new`] with the functions of the embedding application available while it is
+    /// first calculated, so formulas calling them show their results (or the file's cached values
+    /// while their data is pending) rather than `#NAME?`.
+    pub fn with_host_functions(mut wb: Workbook, path: Option<String>, title: String, hosts: Arc<HostFunctionRegistry>) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        calc.set_host_functions(hosts);
+        calc.recalc_loaded(&mut wb);
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
@@ -256,6 +268,9 @@ pub struct Session {
     /// Review › Notes › Show All Notes: every note is displayed. An application display setting
     /// (like Excel's comment indicator option), so it's not saved in the file.
     pub show_all_notes: bool,
+    /// Worksheet functions of the embedding application, shared by every document
+    /// ([`Session::register_host_functions`]).
+    hosts: Arc<HostFunctionRegistry>,
 }
 
 impl Session {
@@ -285,7 +300,16 @@ impl Session {
     pub fn doc_mut(&mut self) -> Result<&mut DocState> {
         self.active_mut().ok_or(EngineError::NoDocument)
     }
-    pub fn add_document(&mut self, d: DocState) -> usize {
+    pub fn add_document(&mut self, mut d: DocState) -> usize {
+        if !Arc::ptr_eq(d.calc.host_functions(), &self.hosts) && !(self.hosts.is_empty() && d.calc.host_functions().is_empty()) {
+            // Created without this session's host functions: calculate their formulas now, as
+            // part of opening (the document stays unmodified).
+            let clean = !d.is_dirty();
+            host_functions::install(&mut d, &self.hosts, None);
+            if clean {
+                d.saved = d.wb.clone();
+            }
+        }
         self.docs.push(d);
         self.active = self.docs.len() - 1;
         self.active

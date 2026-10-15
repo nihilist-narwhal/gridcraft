@@ -1266,3 +1266,32 @@ fn offset_extreme_arguments_return_ref() {
         assert_eq!(crate::evaluate(&wb, 0, c("D1"), formula), Value::Number(expected), "{formula}");
     }
 }
+
+#[test]
+fn an_anchor_given_a_formula_that_reads_its_old_spill_area_sees_it_empty() {
+    // Found by command-sequence fuzzing: the new formula was evaluated while the
+    // old array was still laid out, and only the anchor's dependents were evaluated again.
+    let mut t = T::new();
+    t.set("A1", "=SEQUENCE(3)");
+    assert_eq!(t.num("A3"), 3.0);
+    t.set("A1", "=SUM(A2:A3)+1");
+    assert_eq!((t.num("A1"), t.get("A3")), (1.0, Value::Empty));
+    // Still an array, now spilling elsewhere: it read A2 as 2 and spilled three columns.
+    t.set("A1", "=SEQUENCE(3)");
+    t.set("A1", "=SEQUENCE(1,A2+1)");
+    assert_eq!((t.num("A1"), t.get("B1"), t.get("A2")), (1.0, Value::Empty, Value::Empty));
+}
+
+#[test]
+fn formulas_reading_an_anchor_that_loses_a_spill_conflict_read_spill_errors() {
+    // Found by command-sequence fuzzing: two arrays of one recalculation want the
+    // same (empty) cell; the one laid out second is #SPILL!, and what read its value must say so.
+    let mut t = T::new();
+    t.set("B1", "=SEQUENCE(3)");
+    t.set("A2", "=SEQUENCE(1,3)");
+    t.set("D2", "=A2*10");
+    // Both arrays recalculated together: B1 is laid out first and takes B2.
+    t.calc.recalc_all(&mut t.wb);
+    let spill = Value::Error(CellError::Spill);
+    assert_eq!((t.num("B2"), t.get("A2"), t.get("D2")), (2.0, spill.clone(), spill));
+}
